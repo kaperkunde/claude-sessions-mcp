@@ -1,0 +1,3 @@
+# Not a workspace: this file holds pnpm's settings for the one package.
+# New third-party releases wait a day before they are taken.
+minimumReleaseAge: 1440

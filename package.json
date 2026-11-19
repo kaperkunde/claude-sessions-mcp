@@ -1,0 +1,36 @@
+{
+  "name": "claude-sessions-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An MCP server for one owner's Claude Code cloud sessions: list them, read what one is doing, ask it a side question, message, interrupt or start one, on the owner's own claude.ai login kept inside the container.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@modelcontextprotocol/client": "2.4.0",
+    "@types/node": "24.19.2",
+    "eslint": "9.39.5",
+    "prettier": "3.10.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.2",
+    "vitest": "5.1.0"
+  }
+}
