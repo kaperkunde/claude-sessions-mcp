@@ -35,6 +35,27 @@ export function redact(text: string): string {
     .replace(TOKEN, "[token]")
 }
 
+/**
+ * Whether text holds something that looks like a credential: a key block,
+ * a Bearer value, an Anthropic token, a sign-in code, a GitHub or AWS key,
+ * or a long run of letters and digits with both in it. Narrower than
+ * redact, which also masks long names; used to withhold a whole text.
+ */
+export function holdsSecret(text: string): boolean {
+  return (
+    /-----BEGIN [^-]+-----/.test(text) ||
+    /Bearer\s+[^\s"']{8,}/i.test(text) ||
+    /sk-ant-[A-Za-z0-9]+-/.test(text) ||
+    /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b/.test(
+      text,
+    ) ||
+    new RegExp(SIGN_IN_CODE.source).test(text) ||
+    /(?<![A-Za-z0-9_])(?=[A-Za-z0-9_]*[0-9])(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{32,}/.test(
+      text,
+    )
+  )
+}
+
 /** Where lines go; standard error unless a test hands its own. */
 export type Sink = (line: string) => void
 

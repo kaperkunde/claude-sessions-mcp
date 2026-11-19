@@ -44,6 +44,7 @@ describe("tokens and codes", () => {
         session_id: ID,
         request_id: "req_perm_1",
         decision: "allow",
+        expected_input: '{"command":"echo hi"}',
       }),
     )
     answers.push(await s.call("list_environments"))

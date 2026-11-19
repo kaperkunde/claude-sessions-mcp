@@ -10,7 +10,7 @@ import {
   type ApiEvent,
   type SessionsApi,
 } from "./api.ts"
-import { CliRefusal, ENVIRONMENT_ID, type Cli } from "./cli.ts"
+import { CliRefusal, ENVIRONMENT_ID, checkStart, type Cli } from "./cli.ts"
 import { RenewalError, SignedOut, type Credentials } from "./credentials.ts"
 import { EgressError } from "./egress.ts"
 import {
@@ -18,7 +18,9 @@ import {
   clean,
   controlResponse,
   payloadOf,
-  pendingPermission,
+  pendingAction,
+  permissionView,
+  type PendingAction,
   stateOf,
   summarise,
   typeOf,
@@ -45,6 +47,11 @@ export type ToolDeps = {
   logger: Logger
   now?: () => number
   sleep?: (ms: number) => Promise<void>
+  /**
+   * The prompts answered so far, shared by every MCP request (each makes
+   * its own tool set): main.ts and http.ts hand in one Set.
+   */
+  answered?: Set<string>
 }
 
 type Annotations = {
@@ -86,8 +93,6 @@ const WRITE: Annotations = {
 export const POLL_MS = 1500
 /** A page of events while polling forward for an answer. */
 export const POLL_PAGE = 100
-/** The least time a poll is given, however little is left. */
-export const MIN_POLL_MS = 1000
 export const INTERRUPT_ACK_MS = 15_000
 
 /** Control and format characters: a title is one line that shows. */
@@ -154,10 +159,18 @@ const PendingPermissionView = z.object({
     .string()
     .nullable()
     .describe("What it wants to do, in the session's words."),
-  target: z
+  input: z
     .string()
     .nullable()
-    .describe("The command, file or address it names, masked and cut short."),
+    .describe(
+      "The whole tool input it would run with, as JSON text: what an allow sends, and what answer_permission takes back as expected_input. Null when withheld.",
+    ),
+  input_withheld: z
+    .string()
+    .nullable()
+    .describe(
+      "Why the input is not shown; such a prompt cannot be allowed from here (answer it on claude.ai/code).",
+    ),
 })
 
 /** An environment as list_environments shows it. */
@@ -214,7 +227,6 @@ export function sessionDetail(raw: Record<string, unknown>) {
       600,
     ),
     url: SESSION_URL(id),
-    pending_permission: pendingPermission(raw) ?? null,
   }
 }
 
@@ -232,22 +244,55 @@ function requireSession(value: unknown): string {
   return id
 }
 
+/** How many answered prompts are remembered. */
+export const MAX_ANSWERED = 1000
+
 export function toolSpecs(deps: ToolDeps): ToolSpec[] {
   const { api, cli, credentials } = deps
+  const answered = deps.answered ?? new Set<string>()
   const now = deps.now ?? Date.now
   const sleep =
     deps.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
 
+  /** The prompt a session waits on, shown with the input an allow sends. */
+  async function prompt(id: string, session: Record<string, unknown>) {
+    const action: PendingAction | undefined = pendingAction(session)
+    if (!action) return null
+    return permissionView(
+      action,
+      action.input ?? (await requestInput(id, action.requestId)),
+    )
+  }
+
+  /**
+   * The prompts answered from here, (session, request id): a second answer
+   * is refused even while the record still shows the prompt. Bounded: the
+   * oldest are forgotten first.
+   */
+  function remember(key: string) {
+    answered.add(key)
+    while (answered.size > MAX_ANSWERED) {
+      const oldest = answered.values().next().value
+      if (oldest === undefined) break
+      answered.delete(oldest)
+    }
+  }
+
+  /** What is left until `deadline`, at least 1 ms. */
+  function left(deadline: number): number {
+    return Math.max(1, deadline - now())
+  }
+
   /** The newest event's sequence number, to page forward from. */
   async function newestSeq(
     id: string,
-    timeoutMs: number,
+    deadline: number,
   ): Promise<string | undefined> {
     const { events } = await api.events(id, {
       order: "desc",
       limit: 1,
-      timeoutMs,
+      timeoutMs: left(deadline),
     })
     return lastSeq(events)
   }
@@ -256,59 +301,69 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
    * Pages forward from `after` (a sequence number noted before the
    * request was posted) until the control_response to `requestId`, so an
    * answer is found however many events a busy session writes after it.
-   * Each request gets what is left of the time, at least MIN_POLL_MS.
+   * Each request gets what is left until the deadline. A page whose cursor
+   * does not move ends the paging until the next poll: it never spins.
    */
   async function awaitResponse(
     id: string,
     requestId: string,
     after: string | undefined,
-    ms: number,
+    deadline: number,
   ) {
-    const deadline = now() + ms
     let cursor = after
     for (;;) {
       for (;;) {
-        const left = deadline - now()
+        if (now() >= deadline) return undefined
         const page = await api.events(id, {
           order: "asc",
           limit: POLL_PAGE,
           ...(cursor !== undefined ? { cursor } : {}),
-          timeoutMs: Math.max(MIN_POLL_MS, left),
+          timeoutMs: left(deadline),
         })
         const response = controlResponse(page.events, requestId)
         if (response) return response
-        cursor = lastSeq(page.events) ?? cursor
-        if (!page.nextCursor || page.events.length === 0) break
-        if (now() >= deadline) return undefined
+        const next = lastSeq(page.events) ?? page.nextCursor ?? undefined
+        const moved = next !== undefined && next !== cursor
+        if (moved) cursor = next
+        if (!page.nextCursor || !moved) break
       }
       if (now() + POLL_MS > deadline) return undefined
       await sleep(POLL_MS)
     }
   }
 
-  /** Posts a control request and waits for its answer, up to `ms`. */
+  /**
+   * Posts a control request and waits for its answer, all within `ms`:
+   * the deadline is set here, and every request (the newest event, the
+   * POST, each poll) gets only what is left of it.
+   */
   async function control(
     id: string,
     request: Record<string, unknown>,
     ms: number,
   ) {
+    const deadline = now() + ms
     const requestId = randomUUID()
-    const after = await newestSeq(id, ms)
-    await api.postEvents(id, [
-      {
-        event_type: "control_request",
-        payload: {
-          type: "control_request",
-          uuid: randomUUID(),
-          session_id: id,
-          request_id: requestId,
-          request,
+    const after = await newestSeq(id, deadline)
+    await api.postEvents(
+      id,
+      [
+        {
+          event_type: "control_request",
+          payload: {
+            type: "control_request",
+            uuid: randomUUID(),
+            session_id: id,
+            request_id: requestId,
+            request,
+          },
         },
-      },
-    ])
+      ],
+      left(deadline),
+    )
     return {
       requestId,
-      response: await awaitResponse(id, requestId, after, ms),
+      response: await awaitResponse(id, requestId, after, deadline),
     }
   }
 
@@ -445,7 +500,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
         state: stateOf(newest ?? page.events, session),
         recent: summarise(page.events),
         next_cursor: page.nextCursor,
-        pending_permission: pendingPermission(session) ?? null,
+        pending_permission: await prompt(id, session),
       }
     },
   }
@@ -625,6 +680,11 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     }),
     annotations: WRITE,
     async run(args) {
+      checkStart(
+        args.repo as string,
+        args.task as string,
+        args.branch as string,
+      )
       const environmentId = args.environment_id as string | undefined
       if (environmentId !== undefined) {
         if (!ENVIRONMENT_ID.test(environmentId))
@@ -685,7 +745,13 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     annotations: READ,
     async run(args) {
       const id = requireSession(args.session_id)
-      return { session: sessionDetail({ id, ...(await api.getSession(id)) }) }
+      const raw = await api.getSession(id)
+      return {
+        session: {
+          ...sessionDetail({ id, ...raw }),
+          pending_permission: await prompt(id, raw),
+        },
+      }
     },
   }
 
@@ -719,7 +785,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     name: "answer_permission",
     title: "Answer a Claude Code session's permission prompt",
     description:
-      "Allow once, or deny, the permission prompt a Claude Code cloud session waits on (shown by session_status or get_session as pending_permission), as the owner would on claude.ai. Only the prompt named by request_id, and only while the session still waits on it. Allow only what the owner allowed.",
+      "Allow once, or deny, the permission prompt a Claude Code cloud session waits on (shown by session_status or get_session as pending_permission), as the owner would on claude.ai. Only the prompt named by request_id, only while the session still waits on it, and only once. To allow, pass the prompt's whole input as shown (pending_permission.input) as expected_input: it is sent only if it is exactly what the session would run, and a prompt whose input is withheld cannot be allowed from here. Allow only what the owner allowed.",
     input: z.strictObject({
       session_id: sessionId,
       request_id: z
@@ -730,6 +796,13 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       decision: z
         .enum(["allow", "deny"])
         .describe("allow: this once. deny: it does not run."),
+      expected_input: z
+        .string()
+        .max(20000)
+        .optional()
+        .describe(
+          "Needed to allow: pending_permission.input exactly as shown, so the owner sees here what they allow. An allow whose input is not this, character for character, is refused.",
+        ),
       message: z
         .string()
         .max(2000)
@@ -746,40 +819,43 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     annotations: WRITE,
     async run(args) {
       const id = requireSession(args.session_id)
+      const key = `${id}\n${String(args.request_id)}`
+      if (answered.has(key)) {
+        throw new ToolRefusal(
+          "That prompt was already answered from here; a prompt is answered once. Read session_status again.",
+        )
+      }
       const session = await api.getSession(id)
-      const shown = pendingPermission(session)
-      if (!shown || shown.request_id !== args.request_id) {
+      const action = pendingAction(session)
+      if (!action || action.requestId !== args.request_id) {
         throw new ToolRefusal(
           "The session no longer waits on that prompt (it was answered, withdrawn or replaced). Read session_status again.",
         )
       }
-      const pending = (
-        session.external_metadata as {
-          pending_action?: Record<string, unknown>
-        }
-      ).pending_action!
-      const toolUseId =
-        typeof pending.tool_use_id === "string"
-          ? pending.tool_use_id
-          : undefined
-      const toolName =
-        typeof pending.tool_name === "string" ? pending.tool_name : undefined
       let response: Record<string, unknown>
       if (args.decision === "allow") {
-        const input =
-          pending.input && typeof pending.input === "object"
-            ? pending.input
-            : await requestInput(id, shown.request_id)
-        if (!input) {
+        const input = action.input ?? (await requestInput(id, action.requestId))
+        const view = permissionView(action, input)
+        if (view.input === null || !input) {
           throw new ToolRefusal(
-            "The prompt's tool input could not be read, so it cannot be allowed from here: answer it on claude.ai/code.",
+            `${view.input_withheld ?? "The input could not be read."} It cannot be allowed from here: answer it on claude.ai/code.`,
+          )
+        }
+        if (args.expected_input === undefined) {
+          throw new ToolRefusal(
+            "To allow, pass expected_input: pending_permission.input exactly as session_status shows it, so the owner sees what they allow.",
+          )
+        }
+        if (args.expected_input !== view.input) {
+          throw new ToolRefusal(
+            "expected_input is not the input the session would run with: read session_status again and show the owner its pending_permission.input.",
           )
         }
         response = {
           behavior: "allow",
           updatedInput: input,
-          ...(toolUseId ? { toolUseID: toolUseId } : {}),
-          ...(toolName ? { tool_name: toolName } : {}),
+          ...(action.toolUseId ? { toolUseID: action.toolUseId } : {}),
+          ...(action.toolName ? { tool_name: action.toolName } : {}),
         }
       } else {
         response = {
@@ -787,41 +863,56 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
           message:
             (args.message as string | undefined)?.trim() ||
             "The owner denied this.",
-          ...(toolUseId ? { toolUseID: toolUseId } : {}),
+          ...(action.toolUseId ? { toolUseID: action.toolUseId } : {}),
         }
       }
-      await api.postEvents(id, [
-        {
-          event_type: "control_response",
-          payload: {
-            type: "control_response",
-            uuid: randomUUID(),
-            response: {
-              subtype: "success",
-              request_id: shown.request_id,
-              response,
+      // Taken before the POST, so two calls at once cannot both answer;
+      // given back if the answer did not go in.
+      remember(key)
+      try {
+        await api.postEvents(id, [
+          {
+            event_type: "control_response",
+            payload: {
+              type: "control_response",
+              uuid: randomUUID(),
+              response: {
+                subtype: "success",
+                request_id: action.requestId,
+                response,
+              },
             },
           },
-        },
-      ])
+        ])
+      } catch (error) {
+        answered.delete(key)
+        throw error
+      }
       return {
         sent: true,
         decision: args.decision as "allow" | "deny",
-        tool: shown.tool,
+        tool: action.tool,
       }
     },
   }
 
   /** A permission request's tool input, from its control_request event. */
-  async function requestInput(id: string, requestId: string) {
+  async function requestInput(
+    id: string,
+    requestId: string,
+  ): Promise<Record<string, unknown> | undefined> {
     const events = await api.newestEvents(id, 100)
     for (const event of events) {
       if (typeOf(event) !== "control_request") continue
       const payload = payloadOf(event)
       if (payload.request_id !== requestId) continue
       const request = payload.request as { input?: unknown } | undefined
-      if (request?.input && typeof request.input === "object")
-        return request.input
+      if (
+        request?.input &&
+        typeof request.input === "object" &&
+        !Array.isArray(request.input)
+      )
+        return request.input as Record<string, unknown>
     }
     return undefined
   }

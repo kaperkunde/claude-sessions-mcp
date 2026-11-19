@@ -1,4 +1,4 @@
-import type { Credentials } from "./credentials.ts"
+import { SignedOut, type Credentials } from "./credentials.ts"
 import type { HostKey, Transport } from "./egress.ts"
 import type { Logger } from "./log.ts"
 import { redact } from "./log.ts"
@@ -55,14 +55,16 @@ function apiMessage(body: string): string | undefined {
   return undefined
 }
 
-function failure(status: number, body: string): ApiError {
+function failure(status: number, body: string, events: boolean): ApiError {
   const said = apiMessage(body)
   const suffix = said ? ` (${said})` : ""
   switch (status) {
     case 403:
       return new ApiError(
         status,
-        `The session refused this${suffix}. A session bound to another device (one started from a laptop rather than in the cloud) accepts only events signed on that device: message it from there or from the Claude app.`,
+        events
+          ? `The session refused this${suffix}. A session bound to another device (one started from a laptop rather than in the cloud) accepts only events signed on that device: message it from there or from the Claude app.`
+          : `The sessions API refused this (403)${suffix}. The sign-in may lack the user:sessions:claude_code scope: sign in again with login_start.`,
       )
     case 404:
       return new ApiError(status, `No such session${suffix}.`)
@@ -103,7 +105,7 @@ export class SessionsApi {
     method: "GET" | "POST" | "PUT",
     path: string,
     body?: unknown,
-    options: { timeoutMs?: number; accept?: number[] } = {},
+    options: { timeoutMs?: number; accept?: number[]; events?: boolean } = {},
   ): Promise<{ status: number; data: unknown }> {
     let rejected: string | undefined
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -136,14 +138,20 @@ export class SessionsApi {
         status: response.status,
         ms: this.now() - started,
       })
-      if (response.status === 401 && attempt === 0) {
-        rejected = accessToken
-        continue
+      if (response.status === 401) {
+        if (attempt === 0) {
+          rejected = accessToken
+          continue
+        }
+        throw new SignedOut(
+          "The sessions API refused the sign-in even after it was renewed. Sign in again with login_start.",
+        )
       }
       const accepted =
         (response.status >= 200 && response.status <= 299) ||
         (options.accept ?? []).includes(response.status)
-      if (!accepted) throw failure(response.status, response.body)
+      if (!accepted)
+        throw failure(response.status, response.body, options.events === true)
       if (!response.body || response.status > 299)
         return { status: response.status, data: {} }
       try {
@@ -219,8 +227,14 @@ export class SessionsApi {
   async postEvents(
     id: string,
     events: { event_type: string; payload: Record<string, unknown> }[],
+    timeoutMs?: number,
   ): Promise<void> {
-    await this.call("POST", `/v1/code/sessions/${id}/events`, { events })
+    await this.call(
+      "POST",
+      `/v1/code/sessions/${id}/events`,
+      { events },
+      { events: true, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+    )
   }
 
   /** Archives a session: true, or false when it already was. */

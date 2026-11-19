@@ -67,6 +67,14 @@ export class FakeAnthropic {
   accessExpiresAt: number
   /** Answer the next N API calls 401 whatever the token. */
   force401 = 0
+  /** The record keeps showing an answered prompt, as a lagging worker. */
+  lagging = false
+  /** Every events page is the first, with a next_cursor (a broken API). */
+  stuckCursor = false
+  /** Listing sessions answers 403 (a login without the sessions scope). */
+  forbidList = false
+  /** A renewal answers 200 with this body instead of the tokens. */
+  renewalBody: string | undefined
   sessions = new Map<string, FakeSession>()
   environments: Record<string, unknown>[] = [
     {
@@ -162,6 +170,8 @@ export class FakeAnthropic {
       return error(400, "invalid_grant")
     this.usedRefresh.add(given)
     this.renewals++
+    if (this.renewalBody !== undefined)
+      return { status: 200, headers: {}, body: this.renewalBody }
     this.accessToken = `sk-ant-oat01-renewed${this.renewals}accesstokenCCCCCCCCCCCCCCCCCCCC`
     this.refreshToken = `sk-ant-ort01-renewed${this.renewals}refreshtokenDDDDDDDDDDDDDDDDDDDD`
     this.accessExpiresAt = this.now() + this.accessLifetimeMs
@@ -202,6 +212,7 @@ export class FakeAnthropic {
     }
     const parts = url.pathname.split("/").filter(Boolean) // v1 code sessions [id] [events|archive|unarchive]
     if (parts.length === 3 && request.method === "GET") {
+      if (this.forbidList) return error(403, "missing scope")
       const limit = Number(url.searchParams.get("limit") ?? "20")
       const data = [...this.sessions.values()]
         .map((s) => s.record)
@@ -261,6 +272,14 @@ export class FakeAnthropic {
         : session.events.filter(
             (e) => at === undefined || (e.sequence_num as number) > at,
           )
+      if (this.stuckCursor)
+        return json(200, {
+          data: session.events.slice(0, 1).map((e) => {
+            const { sequence_num: _seq, ...rest } = e
+            return rest
+          }),
+          next_cursor: "1",
+        })
       const page = all.slice(0, limit)
       const more = all.length > page.length
       return json(200, {
@@ -292,7 +311,11 @@ export class FakeAnthropic {
           session.record.external_metadata as
             { pending_action?: { request_id?: string } } | undefined
         )?.pending_action
-        if (pending && response.request_id === pending.request_id) {
+        if (
+          !this.lagging &&
+          pending &&
+          response.request_id === pending.request_id
+        ) {
           session.record.worker_status = "running"
           delete (session.record.external_metadata as Record<string, unknown>)
             .pending_action

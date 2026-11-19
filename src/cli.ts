@@ -44,6 +44,8 @@ export type CliOptions = {
   configDir: string
   credentials: Credentials
   logger: Logger
+  /** start_session's time limit for the CLI; START_SESSION_MS by default. */
+  startTimeoutMs?: number
   /** Where a session's scratch repository is made; the system's by default. */
   tmpRoot?: string
   now?: () => number
@@ -87,6 +89,23 @@ export const GITHUB_REPO =
 export const ENVIRONMENT_ID = /^[A-Za-z][A-Za-z0-9_-]{2,127}$/
 /** A branch name, conservatively. */
 export const BRANCH = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/
+
+/**
+ * What start_session checks before anything else: a repository, a branch,
+ * and a task that the CLI takes as a message (not / or !, a slash or a
+ * shell command).
+ */
+export function checkStart(repo: string, task: string, branch: string): void {
+  if (/^\s*[/!]/.test(task)) {
+    throw new CliRefusal(
+      "The task starts with / or !, which the CLI would take as a slash command or a shell command rather than the session's first message: start it with a word.",
+    )
+  }
+  if (!GITHUB_REPO.test(repo))
+    throw new CliRefusal("repo is a GitHub repository, as owner/name.")
+  if (!BRANCH.test(branch))
+    throw new CliRefusal("branch is a branch name, like main.")
+}
 
 /** The sign-in address in the CLI's output, if it names an allowed host. */
 export function loginUrl(output: string): string | undefined {
@@ -368,17 +387,9 @@ export class Cli {
     branch: string,
     environmentId?: string,
   ): Promise<{ sessionId: string; url?: string; title?: string }> {
-    if (/^\s*[/!]/.test(task)) {
-      throw new CliRefusal(
-        "The task starts with / or !, which the CLI would take as a slash command or a shell command rather than the session's first message: start it with a word.",
-      )
-    }
+    checkStart(repo, task, branch)
     if (environmentId !== undefined && !ENVIRONMENT_ID.test(environmentId))
       throw new CliRefusal("environment_id is an id from list_environments.")
-    if (!GITHUB_REPO.test(repo))
-      throw new CliRefusal("repo is a GitHub repository, as owner/name.")
-    if (!BRANCH.test(branch))
-      throw new CliRefusal("branch is a branch name, like main.")
     const root = this.options.tmpRoot ?? tmpdir()
     const dir = mkdtempSync(join(root, "claude-sessions-"))
     try {
@@ -395,7 +406,6 @@ export class Cli {
         `refs/remotes/origin/${branch}`,
       ])
       const result = await this.options.credentials.serial.run(async () => {
-        // A fresh token on file, so the CLI does not renew it as it runs.
         // A token that lasts the whole run, so the CLI does not renew it.
         await this.options.credentials.tokenInLine(
           undefined,
@@ -423,8 +433,10 @@ export class Cli {
         child.write(task)
         child.write("\n")
         child.end()
-        const done = await this.within(child.wait(), START_SESSION_MS, () =>
-          child.kill(),
+        const done = await this.within(
+          child.wait(),
+          this.options.startTimeoutMs ?? START_SESSION_MS,
+          () => child.kill(),
         )
         return done ?? { code: null, output: child.output() }
       })
@@ -436,6 +448,11 @@ export class Cli {
       this.options.logger.warn("session_start_failed", {
         exit: result.code ?? "timeout",
       })
+      if (result.code === null) {
+        throw new CliRefusal(
+          "The Claude Code CLI did not finish in time, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.",
+        )
+      }
       const said = startError(result.output) ?? lastWords(result.output)
       throw new CliRefusal(
         `The Claude Code CLI did not start a session${said ? `: ${said}` : ""}.`,

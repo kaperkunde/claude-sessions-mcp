@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import {
   closeSync,
   fsyncSync,
@@ -6,6 +6,7 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs"
 import { join } from "node:path"
@@ -117,10 +118,21 @@ export type CredentialsOptions = {
 }
 
 const LOST_RENEWAL =
-  "Renewing the claude.ai sign-in got no answer, and claude.ai may have renewed it all the same, which leaves this service with a used-up sign-in. Sign in again with login_start."
+  "Renewing the claude.ai sign-in got no usable answer, and claude.ai may have renewed it all the same, which leaves this service with a used-up sign-in. Sign in again with login_start."
+
+/**
+ * Beside the login: the SHA-256 of a refresh token whose renewal was sent
+ * and got no usable answer, so it is never sent again, also after a
+ * restart. Never the token itself.
+ */
+export const LOST_REFRESH_FILE = ".claude-sessions-lost-refresh"
+
+function digest(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex")
+}
 
 export class Credentials {
-  /** A refresh token whose renewal got no answer: never sent again. */
+  /** The digest of a refresh token whose renewal was lost: never sent again. */
   private lostRefresh: string | undefined
   readonly dir: string
   readonly serial: Serial
@@ -232,19 +244,20 @@ export class Credentials {
   }
 
   private async renew(tokens: OAuthTokens): Promise<string> {
-    if (!tokens.refreshToken) {
+    const refreshToken = tokens.refreshToken
+    if (!refreshToken) {
       throw new SignedOut(
         "The sign-in cannot be renewed. Sign in again with login_start.",
       )
     }
-    if (tokens.refreshToken === this.lostRefresh) {
+    if (this.isLost(refreshToken)) {
       // Sent once already, and the answer was lost: claude.ai may have
       // rotated it, and a refresh token sent twice can end the login.
       throw new SignedOut(LOST_RENEWAL)
     }
     const body: Record<string, string> = {
       grant_type: "refresh_token",
-      refresh_token: tokens.refreshToken,
+      refresh_token: refreshToken,
       client_id: CLIENT_ID,
     }
     if (tokens.scopes && tokens.scopes.length > 0)
@@ -264,9 +277,7 @@ export class Credentials {
         timeoutMs: RENEWAL_TIMEOUT_MS,
       })
     } catch {
-      this.lostRefresh = tokens.refreshToken
-      this.logger.warn("login_renewal_lost")
-      throw new SignedOut(LOST_RENEWAL)
+      this.lose(refreshToken)
     }
     this.logger.info("login_renewal", {
       status: response.status,
@@ -282,23 +293,58 @@ export class Credentials {
         `Renewing the claude.ai sign-in failed (${response.status}). Try again in a minute.`,
       )
     }
-    let data: Record<string, unknown>
+    // A 200 means claude.ai took the refresh token: from here on, an
+    // answer that cannot be used or kept leaves a used-up sign-in.
+    let data: Record<string, unknown> | undefined
     try {
-      data = JSON.parse(response.body) as Record<string, unknown>
+      const parsed: unknown = JSON.parse(response.body)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+        data = parsed as Record<string, unknown>
     } catch {
-      throw new RenewalError("Renewing the claude.ai sign-in gave no answer.")
+      data = undefined
     }
-    const accessToken = str(data.access_token)
-    const expiresIn = data.expires_in
-    if (!accessToken || typeof expiresIn !== "number") {
-      throw new RenewalError("Renewing the claude.ai sign-in gave no token.")
+    const accessToken = str(data?.access_token)
+    const expiresIn = data?.expires_in
+    if (!data || !accessToken || typeof expiresIn !== "number")
+      this.lose(refreshToken)
+    try {
+      this.write({
+        accessToken,
+        refreshToken: str(data.refresh_token) ?? refreshToken,
+        expiresAt: this.now() + expiresIn * 1000,
+      })
+    } catch {
+      this.lose(refreshToken)
     }
-    this.write({
-      accessToken,
-      refreshToken: str(data.refresh_token) ?? tokens.refreshToken,
-      expiresAt: this.now() + expiresIn * 1000,
-    })
     return accessToken
+  }
+
+  private isLost(refreshToken: string): boolean {
+    if (this.lostRefresh === undefined) {
+      try {
+        this.lostRefresh = readFileSync(
+          join(this.dir, LOST_REFRESH_FILE),
+          "utf8",
+        ).trim()
+      } catch {
+        this.lostRefresh = ""
+      }
+    }
+    return this.lostRefresh !== "" && this.lostRefresh === digest(refreshToken)
+  }
+
+  /** Marks a refresh token as sent and lost, here and on disk; throws. */
+  private lose(refreshToken: string): never {
+    this.lostRefresh = digest(refreshToken)
+    try {
+      writeFileSync(join(this.dir, LOST_REFRESH_FILE), this.lostRefresh, {
+        mode: 0o600,
+      })
+    } catch {
+      this.logger.error("lost_refresh_unwritable")
+    }
+    this.logger.warn("login_renewal_lost")
+    throw new SignedOut(LOST_RENEWAL)
   }
 
   /**

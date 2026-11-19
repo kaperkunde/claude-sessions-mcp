@@ -36,7 +36,7 @@ pinned in the image and why there is a smoke test to run after updating it
 | `login_status`      | Read  | allowed         | Whether the service is signed in and as whom (email, organization, plan), when the access token lapses, whether a sign-in waits for its code. Never a token.                                                                                                            |
 | `send_message`      | Write | **ask**         | A message into the session's conversation, as if you typed it; a busy session takes it at its next step, or as `priority` says (`now`, `next`, `later`). `interrupt_first` stops the current turn first.                                                                |
 | `interrupt_session` | Write | **ask**         | Stops the current turn (as Esc does) and drops queued messages; background tasks keep running.                                                                                                                                                                          |
-| `answer_permission` | Write | **ask**         | Allows once, or denies (with a message), the permission prompt a session waits on: only the one `request_id` names, and only while it still waits on it.                                                                                                                |
+| `answer_permission` | Write | **ask**         | Allows once (with `expected_input`, the shown input echoed back exactly), or denies with a message, the permission prompt a session waits on: only the one `request_id` names, only while it still waits on it, and only once.                                          |
 | `start_session`     | Write | **ask**         | A new cloud session on a GitHub `repo` (owner/name) with `task` as its first message, through `claude --cloud`, in your default cloud environment or the one `environment_id` names. `branch` is the repository's default branch (`main` if left out).                  |
 | `archive_session`   | Write | **ask**         | Archives a session, as on claude.ai/code: it stops and leaves the list. Nothing is deleted.                                                                                                                                                                             |
 | `unarchive_session` | Write | **ask**         | Brings an archived session back. claude.ai may ask for a trusted device for this; it then says to do it on claude.ai/code.                                                                                                                                              |
@@ -64,13 +64,24 @@ links, which the session record does not carry.
 When a session waits on a permission prompt (its worker is
 `requires_action`), `session_status` and `get_session` show it as
 `pending_permission`: the prompt's `request_id`, the tool, the session's
-own description of what it wants, and the command, file or address it
-names, masked (tokens and keys hidden) and cut to 300 characters. Never
-the tool's whole input. `answer_permission` then answers it as the CLI
-does, with a `control_response`: allow (this once, with the input the
-session asked for, unchanged) or deny (with your message). It reads the
-session again first and refuses when that prompt is no longer the one it
-waits on, so it never answers a prompt you were not shown.
+own description of what it wants, and **the whole tool input it would run
+with**, as JSON text (`input`): exactly what an allow sends, taken from
+the session's record or, when the record has none, from the prompt's own
+event. The input is withheld (`input` null, `input_withheld` says why)
+when it cannot be read, is longer than 4,000 characters, looks like it
+holds a secret (a key, a token, a Bearer value), or has characters that
+do not show as they are (bidi, zero-width). A withheld prompt cannot be
+allowed from here: answer it on claude.ai/code.
+
+`answer_permission` answers it as the CLI does, with a `control_response`:
+deny (with your message), or allow this once, which needs
+`expected_input`: the shown `input`, echoed back. It is sent only when it
+is, character for character, the input the session would run with, so
+PCP's approval page, which shows a call's arguments, shows you exactly
+what you allow. It reads the session again first and refuses when that
+prompt is no longer the one it waits on, and it answers a prompt once:
+the service remembers the prompts it answered (the newest 1,000) and
+refuses a second answer, even while the record still shows the prompt.
 
 **Untrusted text.** What a session wrote, and whatever it read on the way
 (a web page, an issue, a file), comes back in `session_status`,
@@ -181,9 +192,15 @@ use, and a refresh token used twice can end the login**, so:
   renamed into place;
 - before the CLI runs, the token is renewed if it would lapse before the
   run's time limit is up, so the CLI never renews it itself;
-- a renewal that gets no answer (claude.ai may have rotated the token all
-  the same) is never sent again: tools then say to sign in again with
-  `login_start`;
+- a renewal that gets no usable answer (none, one that is not JSON or has
+  no token, or one that cannot be written down), after which claude.ai may
+  have rotated the token all the same, is never sent again: the refresh
+  token's SHA-256 is kept beside the login
+  (`.claude-sessions-lost-refresh`), so a restart remembers it too, and
+  tools say to sign in again with `login_start`;
+- a 401 that comes again after a renewal also says to sign in again, and a
+  403 outside a session's events says the sign-in may lack the
+  `user:sessions:claude_code` scope;
 - **one container owns the login.** Never copy the volume to another
   container or machine, never mount it twice, and do not run `claude` by
   hand in the container while the service runs: two holders of one refresh
@@ -235,7 +252,12 @@ folder as the working directory; files outside it, the login included,
 need a prompt.
 
 Every request has a deadline (45 seconds at most, however slowly its
-bytes come in), and `ask_session`'s polls get what is left of its time.
+bytes come in). `ask_session` and `interrupt_session` set theirs when they
+start, and every request they make (the newest event, the POST, each
+poll) gets only what is left; a page whose cursor does not move ends the
+paging until the next poll. If the CLI runs past `start_session`'s time
+limit, the answer says a session may have started: check `list_sessions`
+before trying again.
 
 `ask_session` usually answers in about ten seconds. If your PCP gives the
 service a shorter time limit than `timeout_seconds`, raise the limit on the

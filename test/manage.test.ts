@@ -104,7 +104,7 @@ describe("session_status", () => {
     ).toMatch(/cursor/)
   })
 
-  it("shows the permission prompt it waits on, masked, never the whole input", async () => {
+  it("withholds a permission prompt's input that holds a secret", async () => {
     const s = setup()
     s.fake.addSession(ID)
     s.fake.askPermission(ID, {
@@ -123,7 +123,9 @@ describe("session_status", () => {
       request_id: "req_perm_1",
       tool: "Bash",
       description: "Run the deploy script",
-      target: "TOKEN=[token] ./deploy.sh",
+      input: null,
+      input_withheld:
+        "The input looks like it holds a secret, so it is not shown.",
     })
     expect(JSON.stringify(answer)).not.toContain("SECRET_ONLY_IN_INPUT")
   })
@@ -149,6 +151,7 @@ describe("answer_permission", () => {
         session_id: ID,
         request_id: "req_perm_1",
         decision: "allow",
+        expected_input: '{"command":"pnpm test"}',
       }),
     ).toEqual({ sent: true, decision: "allow", tool: "Bash" })
     const event = lastPosted(s)
@@ -198,6 +201,7 @@ describe("answer_permission", () => {
       session_id: ID,
       request_id: "req_perm_1",
       decision: "allow",
+      expected_input: '{"command":"pnpm test"}',
     })
     expect(lastPosted(s).payload.response).toMatchObject({
       response: { behavior: "allow", updatedInput: { command: "pnpm test" } },
@@ -228,7 +232,7 @@ describe("answer_permission", () => {
           decision: "allow",
         }),
       ),
-    ).toMatch(/no longer waits/)
+    ).toMatch(/already answered/)
     expect(s.fake.posted).toHaveLength(1)
   })
 })

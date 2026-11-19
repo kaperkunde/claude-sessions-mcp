@@ -5,7 +5,7 @@
 // Every run is recorded in <CLAUDE_CONFIG_DIR>/fake-cli-runs.jsonl.
 //
 // The first argument may be --fake-mode=<mode>: no-url, cloud-fail,
-// cloud-text, slow (a sign-in that takes 1.5 s to finish).
+// cloud-text, cloud-hang, slow (a sign-in that takes 1.5 s to finish).
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { createInterface } from "node:readline"
@@ -135,6 +135,8 @@ if (args.includes("--cloud")) {
     )
     process.exit(1)
   }
+  if (mode === "cloud-hang")
+    await new Promise(() => setInterval(() => {}, 1000))
   if (mode === "cloud-text") {
     process.stdout.write(
       "Created cloud session: Fake\nSession ID: cse_textsession01\nView: https://claude.ai/code/cse_textsession01\n",

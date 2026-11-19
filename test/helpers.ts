@@ -73,12 +73,14 @@ export function setup(
     signedIn?: boolean
     expiresInMs?: number
     fakeMode?: string
+    startTimeoutMs?: number
+    dir?: string
     transport?: (fake: FakeAnthropic) => Transport
   } = {},
 ): Setup {
   const clock = new Clock()
   const fake = new FakeAnthropic(clock.now)
-  const dir = tempDir()
+  const dir = options.dir ?? tempDir()
   if (options.signedIn !== false) {
     writeLogin(dir, {
       expiresAt: clock.now() + (options.expiresInMs ?? 8 * 60 * 60 * 1000),
@@ -111,6 +113,9 @@ export function setup(
     credentials,
     logger,
     tmpRoot: tempDir(),
+    ...(options.startTimeoutMs !== undefined
+      ? { startTimeoutMs: options.startTimeoutMs }
+      : {}),
     now: clock.now,
     env: {
       PATH: process.env.PATH,

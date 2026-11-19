@@ -1,5 +1,5 @@
 import type { ApiEvent } from "./api.ts"
-import { redact } from "./log.ts"
+import { holdsSecret, redact } from "./log.ts"
 
 /**
  * Reading a session's events. An event is `{event_type, payload, …}`, and
@@ -240,34 +240,52 @@ export function answerOf(
   return { ok: true, answer: clean(answer, MAX_ANSWER_CHARS) }
 }
 
-/** A permission prompt a session waits on, as the owner is shown it. */
-export type PendingPermission = {
-  request_id: string
-  /** The tool it wants to use. */
+/**
+ * A permission prompt a session waits on, as the session's record has it
+ * (`worker_status` requires_action, `external_metadata.pending_action`).
+ */
+export type PendingAction = {
+  requestId: string
+  /** The tool, as shown. */
   tool: string
-  /** What it wants to do, in the session's words, masked and cut short. */
+  /** The tool's own name, as the answer names it. */
+  toolName: string | undefined
+  toolUseId: string | undefined
   description: string | null
-  /** The command or file it names, masked and cut short. */
-  target: string | null
+  /** The tool input on the record, if it carries one. */
+  input: Record<string, unknown> | undefined
 }
+
+/** A permission prompt as the owner (and an assistant) is shown it. */
+export type PermissionView = {
+  request_id: string
+  tool: string
+  description: string | null
+  /**
+   * The whole tool input, as the JSON text answer_permission sends and
+   * takes back as expected_input; null when it is withheld.
+   */
+  input: string | null
+  /** Why the input is not shown (and the prompt cannot be allowed here). */
+  input_withheld: string | null
+}
+
+/** The most of an input shown, and so allowed, whole. */
+export const MAX_SHOWN_INPUT_CHARS = 4000
 
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_:.-]{0,127}$/
 const REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/
+/** Format characters (bidi, zero-width): text that shows otherwise than it is. */
+const FORMAT = /\p{Cf}/u
 
 function shown(value: unknown, max: number): string | null {
   if (typeof value !== "string" || !value.trim()) return null
   return redact(clean(value.trim(), max))
 }
 
-/**
- * The permission prompt the session's record says it waits on
- * (`worker_status` requires_action, `external_metadata.pending_action`),
- * or undefined. Never the tool's whole input: its description, and the
- * command or file it names, masked.
- */
-export function pendingPermission(
+export function pendingAction(
   session: Record<string, unknown>,
-): PendingPermission | undefined {
+): PendingAction | undefined {
   if (session.worker_status !== "requires_action") return undefined
   const pending = obj(obj(session.external_metadata)?.pending_action)
   if (!pending) return undefined
@@ -277,15 +295,57 @@ export function pendingPermission(
   const tool = [pending.display_tool_name, pending.tool_name].find(
     (name): name is string => typeof name === "string" && TOOL_NAME.test(name),
   )
-  const input = obj(pending.input)
   return {
-    request_id: requestId,
+    requestId,
     tool: tool ?? "a tool",
+    toolName:
+      typeof pending.tool_name === "string" && TOOL_NAME.test(pending.tool_name)
+        ? pending.tool_name
+        : undefined,
+    toolUseId:
+      typeof pending.tool_use_id === "string" &&
+      REQUEST_ID.test(pending.tool_use_id)
+        ? pending.tool_use_id
+        : undefined,
     description: shown(pending.action_description, 300),
-    target:
-      shown(input?.command, 300) ??
-      shown(input?.file_path, 300) ??
-      shown(input?.url, 300) ??
-      shown(input?.path, 300),
+    input: obj(pending.input),
   }
+}
+
+/**
+ * The prompt as shown: the exact input that an allow would send, as JSON
+ * text, whole or not at all. Withheld (and so never allowed from here)
+ * when it is missing, longer than MAX_SHOWN_INPUT_CHARS, holds something
+ * that looks like a secret, or has characters that do not show as they
+ * are.
+ */
+export function permissionView(
+  action: PendingAction,
+  input: Record<string, unknown> | undefined,
+): PermissionView {
+  const base = {
+    request_id: action.requestId,
+    tool: action.tool,
+    description: action.description,
+  }
+  const withheld = (reason: string): PermissionView => ({
+    ...base,
+    input: null,
+    input_withheld: reason,
+  })
+  if (!input) return withheld("The prompt's input could not be read.")
+  const text = JSON.stringify(input)
+  if (text.length > MAX_SHOWN_INPUT_CHARS)
+    return withheld(
+      `The input is too long to show whole (${text.length} characters; at most ${MAX_SHOWN_INPUT_CHARS}).`,
+    )
+  if (holdsSecret(text))
+    return withheld(
+      "The input looks like it holds a secret, so it is not shown.",
+    )
+  if (FORMAT.test(text))
+    return withheld(
+      "The input has characters that do not show as they are (bidi or zero-width).",
+    )
+  return { ...base, input: text, input_withheld: null }
 }

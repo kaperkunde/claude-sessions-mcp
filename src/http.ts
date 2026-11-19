@@ -133,13 +133,15 @@ export function createMcpHttpServer(
   deps: ToolDeps,
   logger: Logger,
 ): Server {
+  // One memory of answered prompts for every request's tool set.
+  const shared: ToolDeps = { ...deps, answered: deps.answered ?? new Set() }
   const handler = createMcpHandler(
     () => {
       const server = new McpServer({
         name: SERVER_NAME,
         version: SERVER_VERSION,
       })
-      registerTools(server, deps)
+      registerTools(server, shared)
       return server
     },
     {
