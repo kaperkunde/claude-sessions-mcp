@@ -40,11 +40,16 @@ export const SIGN_IN_HOSTS = [
 
 export type OutgoingRequest = {
   host: HostKey
-  method: "GET" | "POST"
+  method: "GET" | "POST" | "PUT"
   /** The path and query. Never a URL. */
   path: string
   headers: Record<string, string>
   body?: string
+  /**
+   * The most this request may take, all of it (connecting, sending,
+   * reading); at most REQUEST_DEADLINE_MS, which is also the default.
+   */
+  timeoutMs?: number
 }
 
 export type IncomingResponse = {
@@ -56,12 +61,16 @@ export type IncomingResponse = {
 export type Transport = (request: OutgoingRequest) => Promise<IncomingResponse>
 
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+/** No byte for this long: the request is dropped. */
 export const REQUEST_TIMEOUT_MS = 30_000
+/** The whole of a request, however slowly its bytes trickle in. */
+export const REQUEST_DEADLINE_MS = 45_000
 
-const QUERY = "(?:\\?[A-Za-z0-9\\-_.~=&]*)?"
+/** A query of URL-safe and percent-encoded characters. */
+const QUERY = "(?:\\?[A-Za-z0-9\\-_.~=&%]*)?"
 const PATHS: Record<HostKey, RegExp> = {
   api: new RegExp(
-    `^/v1/code/sessions(?:/[A-Za-z0-9_-]{1,128}(?:/events)?)?${QUERY}$`,
+    `^/v1/(?:code/sessions(?:/[A-Za-z0-9_-]{1,128}(?:/(?:events|archive|unarchive))?)?|environment_providers)${QUERY}$`,
   ),
   auth: /^\/v1\/oauth\/token$/,
 }
@@ -90,8 +99,11 @@ export function wireHeaders(outgoing: OutgoingRequest): Record<string, string> {
   }
 }
 
-/** The transport to the two hosts above. */
-export function httpsTransport(): Transport {
+/** The transport to the two hosts above. `request` is for tests only. */
+export function httpsTransport(
+  options: { request?: typeof httpsRequest } = {},
+): Transport {
+  const send = options.request ?? httpsRequest
   // Our own agent: no global agent another module could have changed, and
   // node:https never reads HTTP(S)_PROXY. Certificates are checked against
   // the system's roots, said outright.
@@ -108,7 +120,14 @@ export function httpsTransport(): Transport {
         reject(new EgressError("Refused a request this service does not make."))
         return
       }
-      const req = httpsRequest(
+      const deadline = Math.max(
+        1,
+        Math.min(
+          outgoing.timeoutMs ?? REQUEST_DEADLINE_MS,
+          REQUEST_DEADLINE_MS,
+        ),
+      )
+      const req = send(
         {
           host,
           servername: host,
@@ -146,10 +165,19 @@ export function httpsTransport(): Transport {
           res.on("error", reject)
         },
       )
+      const timer = setTimeout(
+        () => req.destroy(new EgressError(`${host} did not answer in time.`)),
+        deadline,
+      )
+      timer.unref()
       req.on("timeout", () =>
         req.destroy(new EgressError(`${host} did not answer in time.`)),
       )
-      req.on("error", reject)
+      req.on("error", (error) => {
+        clearTimeout(timer)
+        reject(error)
+      })
+      req.on("close", () => clearTimeout(timer))
       req.end(outgoing.body)
     })
 }

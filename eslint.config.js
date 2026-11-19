@@ -126,7 +126,11 @@ export default tseslint.config(
     // The fake CLI is plain Node, run as a child process by the tests.
     files: ["test/**/*.mjs"],
     languageOptions: {
-      globals: { process: "readonly", console: "readonly" },
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        setTimeout: "readonly",
+      },
     },
   },
 )

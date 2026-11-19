@@ -3,7 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { RenewalError, SignedOut, type Credentials } from "./credentials.ts"
+import {
+  REFRESH_MARGIN_MS,
+  RenewalError,
+  SignedOut,
+  type Credentials,
+} from "./credentials.ts"
 import { SIGN_IN_HOSTS } from "./egress.ts"
 import type { Logger } from "./log.ts"
 import { redact } from "./log.ts"
@@ -78,6 +83,8 @@ export const SIGN_IN_CODE = /^[A-Za-z0-9_-]{8,512}#[A-Za-z0-9_-]{8,256}$/
 /** owner/name on GitHub. */
 export const GITHUB_REPO =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/
+/** A cloud environment's id, as list_environments answers them. */
+export const ENVIRONMENT_ID = /^[A-Za-z][A-Za-z0-9_-]{2,127}$/
 /** A branch name, conservatively. */
 export const BRANCH = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/
 
@@ -117,6 +124,7 @@ export function lastWords(output: string, without: string[] = []): string {
 export class Cli {
   private readonly options: CliOptions
   private readonly now: () => number
+  private loginLine: Promise<unknown> = Promise.resolve()
   private pending:
     | { child: Child; url: string; expiresAt: number; timer: NodeJS.Timeout }
     | undefined
@@ -245,7 +253,15 @@ export class Cli {
    * the code that page shows, for LOGIN_TTL_MS; a new start ends an
    * earlier one.
    */
-  async loginStart(): Promise<{ url: string; expiresAt: number }> {
+  loginStart(): Promise<{ url: string; expiresAt: number }> {
+    // One at a time: a second start ends the first's CLI only once the
+    // first has one, so no CLI is left running unowned.
+    const result = this.loginLine.then(() => this.loginStartNow())
+    this.loginLine = result.catch(() => undefined)
+    return result
+  }
+
+  private async loginStartNow(): Promise<{ url: string; expiresAt: number }> {
     this.dropPending()
     const child = this.claude(["auth", "login", "--claudeai"])
     const found = await this.within(
@@ -271,7 +287,9 @@ export class Cli {
     }
     const expiresAt = this.now() + LOGIN_TTL_MS
     const timer = setTimeout(() => {
-      if (this.pending?.child === child) this.dropPending()
+      // This sign-in's own CLI, whatever is pending by now.
+      child.kill()
+      if (this.pending?.child === child) this.pending = undefined
     }, LOGIN_TTL_MS)
     timer.unref()
     this.pending = { child, url: found, expiresAt, timer }
@@ -348,7 +366,15 @@ export class Cli {
     repo: string,
     task: string,
     branch: string,
+    environmentId?: string,
   ): Promise<{ sessionId: string; url?: string; title?: string }> {
+    if (/^\s*[/!]/.test(task)) {
+      throw new CliRefusal(
+        "The task starts with / or !, which the CLI would take as a slash command or a shell command rather than the session's first message: start it with a word.",
+      )
+    }
+    if (environmentId !== undefined && !ENVIRONMENT_ID.test(environmentId))
+      throw new CliRefusal("environment_id is an id from list_environments.")
     if (!GITHUB_REPO.test(repo))
       throw new CliRefusal("repo is a GitHub repository, as owner/name.")
     if (!BRANCH.test(branch))
@@ -370,9 +396,28 @@ export class Cli {
       ])
       const result = await this.options.credentials.serial.run(async () => {
         // A fresh token on file, so the CLI does not renew it as it runs.
-        await this.options.credentials.tokenInLine()
+        // A token that lasts the whole run, so the CLI does not renew it.
+        await this.options.credentials.tokenInLine(
+          undefined,
+          REFRESH_MARGIN_MS + START_SESSION_MS,
+        )
         const child = this.claude(
-          ["-p", "--cloud", "--output-format", "json"],
+          [
+            "-p",
+            "--cloud",
+            "--output-format",
+            "json",
+            // The environment the CLI's /remote-env would set, for this
+            // run only (flag settings are a source it trusts for it).
+            ...(environmentId !== undefined
+              ? [
+                  "--settings",
+                  JSON.stringify({
+                    remote: { defaultEnvironmentId: environmentId },
+                  }),
+                ]
+              : []),
+          ],
           dir,
         )
         child.write(task)

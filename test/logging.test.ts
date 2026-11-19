@@ -32,6 +32,26 @@ describe("tokens and codes", () => {
       }),
     )
     answers.push(await s.call("interrupt_session", { session_id: ID }))
+    s.fake.askPermission(ID, {
+      requestId: "req_perm_1",
+      toolName: "Bash",
+      description: "Run it",
+      input: { command: "echo hi" },
+    })
+    answers.push(await s.call("get_session", { session_id: ID }))
+    answers.push(
+      await s.call("answer_permission", {
+        session_id: ID,
+        request_id: "req_perm_1",
+        decision: "allow",
+      }),
+    )
+    answers.push(await s.call("list_environments"))
+    answers.push(
+      await s.call("rename_session", { session_id: ID, title: "Renamed" }),
+    )
+    answers.push(await s.call("archive_session", { session_id: ID }))
+    answers.push(await s.call("unarchive_session", { session_id: ID }))
     answers.push(
       await s.call("start_session", { repo: "kaperkunde/pcp", task: "x" }),
     )
@@ -69,6 +89,8 @@ describe("tokens and codes", () => {
     // No session text in the log either.
     expect(log).not.toContain("Working on it")
     expect(log).not.toContain("status?")
+    expect(log).not.toContain("Renamed")
+    expect(log).not.toContain("echo hi")
   })
 
   it("redact masks tokens, bearer headers and sign-in codes", () => {

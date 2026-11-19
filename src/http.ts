@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto"
+import { createHash, timingSafeEqual } from "node:crypto"
 import {
   createServer,
   type IncomingMessage,
@@ -68,11 +68,17 @@ export function hostAllowed(
   )
 }
 
-function bearerMatches(header: string | undefined, token: string): boolean {
+/** Compares digests of equal length, so the time taken says nothing of either. */
+export function bearerMatches(
+  header: string | undefined,
+  token: string,
+): boolean {
   if (!header?.startsWith("Bearer ")) return false
-  const given = Buffer.from(header.slice("Bearer ".length).trim(), "utf8")
-  const expected = Buffer.from(token, "utf8")
-  return given.length === expected.length && timingSafeEqual(given, expected)
+  const given = createHash("sha256")
+    .update(header.slice("Bearer ".length).trim(), "utf8")
+    .digest()
+  const expected = createHash("sha256").update(token, "utf8").digest()
+  return timingSafeEqual(given, expected)
 }
 
 function plain(res: ServerResponse, status: number, text: string) {

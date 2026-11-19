@@ -97,7 +97,7 @@ describe("the HTTP side", () => {
     expect(right.status).toBe(200)
   })
 
-  it("lists the nine tools over MCP, with their annotations", async () => {
+  it("lists the fifteen tools over MCP, with their annotations", async () => {
     const { base, fake } = await serve("a-long-enough-token-123")
     const client = new Client({ name: "test", version: "1" })
     await client.connect(
@@ -109,15 +109,21 @@ describe("the HTTP side", () => {
     )
     const { tools } = await client.listTools()
     expect(tools.map((t) => t.name).sort()).toEqual([
+      "answer_permission",
+      "archive_session",
       "ask_session",
+      "get_session",
       "interrupt_session",
+      "list_environments",
       "list_sessions",
       "login_finish",
       "login_start",
       "login_status",
+      "rename_session",
       "send_message",
       "session_status",
       "start_session",
+      "unarchive_session",
     ])
     for (const tool of tools) {
       expect(tool.annotations?.readOnlyHint, tool.name).toBeTypeOf("boolean")

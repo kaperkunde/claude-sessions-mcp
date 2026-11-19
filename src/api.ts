@@ -100,10 +100,11 @@ export class SessionsApi {
   }
 
   private async call(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PUT",
     path: string,
     body?: unknown,
-  ): Promise<unknown> {
+    options: { timeoutMs?: number; accept?: number[] } = {},
+  ): Promise<{ status: number; data: unknown }> {
     let rejected: string | undefined
     for (let attempt = 0; attempt < 2; attempt++) {
       const { accessToken, organizationUuid } =
@@ -124,6 +125,9 @@ export class SessionsApi {
         path,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        ...(options.timeoutMs !== undefined
+          ? { timeoutMs: options.timeoutMs }
+          : {}),
       })
       this.logger.info("api_request", {
         method,
@@ -136,11 +140,17 @@ export class SessionsApi {
         rejected = accessToken
         continue
       }
-      if (response.status < 200 || response.status > 299)
-        throw failure(response.status, response.body)
-      if (!response.body) return {}
+      const accepted =
+        (response.status >= 200 && response.status <= 299) ||
+        (options.accept ?? []).includes(response.status)
+      if (!accepted) throw failure(response.status, response.body)
+      if (!response.body || response.status > 299)
+        return { status: response.status, data: {} }
       try {
-        return JSON.parse(response.body) as unknown
+        return {
+          status: response.status,
+          data: JSON.parse(response.body) as unknown,
+        }
       } catch {
         throw new ApiError(
           response.status,
@@ -152,36 +162,57 @@ export class SessionsApi {
   }
 
   async listSessions(limit: number): Promise<Record<string, unknown>[]> {
-    const data = (await this.call(
-      "GET",
-      `/v1/code/sessions?limit=${limit}`,
-    )) as { data?: unknown }
-    return Array.isArray(data.data)
-      ? data.data.filter(
-          (item): item is Record<string, unknown> =>
-            !!item && typeof item === "object",
-        )
-      : []
+    const { data } = await this.call("GET", `/v1/code/sessions?limit=${limit}`)
+    return objects((data as { data?: unknown }).data)
   }
 
   async getSession(id: string): Promise<Record<string, unknown>> {
-    const data = await this.call("GET", `/v1/code/sessions/${id}`)
+    const { data } = await this.call("GET", `/v1/code/sessions/${id}`)
     return data && typeof data === "object"
       ? (data as Record<string, unknown>)
       : {}
   }
 
+  /**
+   * A page of events. `desc`: newest first, older than `cursor` (a
+   * next_cursor from the page before) when given. `asc`: oldest first,
+   * after `cursor` (a sequence number), as the CLI pages forward.
+   */
+  async events(
+    id: string,
+    page: {
+      order: "asc" | "desc"
+      limit: number
+      cursor?: string
+      timeoutMs?: number
+    },
+  ): Promise<{ events: ApiEvent[]; nextCursor: string | null }> {
+    const query = new URLSearchParams({
+      limit: String(page.limit),
+      sort_order: page.order,
+      ...(page.cursor !== undefined ? { cursor: page.cursor } : {}),
+    })
+    const { data } = await this.call(
+      "GET",
+      `/v1/code/sessions/${id}/events?${query.toString()}`,
+      undefined,
+      page.timeoutMs !== undefined ? { timeoutMs: page.timeoutMs } : {},
+    )
+    const next = (data as { next_cursor?: unknown }).next_cursor
+    return {
+      events: objects((data as { data?: unknown }).data),
+      nextCursor:
+        typeof next === "string" && CURSOR.test(next)
+          ? next
+          : typeof next === "number"
+            ? String(next)
+            : null,
+    }
+  }
+
   /** The newest `limit` events, newest first. */
   async newestEvents(id: string, limit: number): Promise<ApiEvent[]> {
-    const data = (await this.call(
-      "GET",
-      `/v1/code/sessions/${id}/events?limit=${limit}&sort_order=desc`,
-    )) as { data?: unknown }
-    return Array.isArray(data.data)
-      ? data.data.filter(
-          (item): item is ApiEvent => !!item && typeof item === "object",
-        )
-      : []
+    return (await this.events(id, { order: "desc", limit })).events
   }
 
   /** Posts events, each as the API takes them: {event_type, payload}. */
@@ -191,4 +222,45 @@ export class SessionsApi {
   ): Promise<void> {
     await this.call("POST", `/v1/code/sessions/${id}/events`, { events })
   }
+
+  /** Archives a session: true, or false when it already was. */
+  async archive(id: string): Promise<boolean> {
+    const { status } = await this.call(
+      "POST",
+      `/v1/code/sessions/${id}/archive`,
+      {},
+      { accept: [409] },
+    )
+    return status !== 409
+  }
+
+  async unarchive(id: string): Promise<void> {
+    await this.call("POST", `/v1/code/sessions/${id}/unarchive`, {})
+  }
+
+  /** Sets a session's title, as the CLI does (PUT with the title alone). */
+  async rename(id: string, title: string): Promise<void> {
+    await this.call("PUT", `/v1/code/sessions/${id}`, { title })
+  }
+
+  /** The cloud environments the account can start sessions in. */
+  async environments(limit: number): Promise<Record<string, unknown>[]> {
+    const { data } = await this.call(
+      "GET",
+      `/v1/environment_providers?limit=${limit}`,
+    )
+    return objects((data as { environments?: unknown }).environments)
+  }
+}
+
+/** A cursor as the API hands them out, safe to send back in a query. */
+export const CURSOR = /^[A-Za-z0-9_.~=+/-]{1,512}$/
+
+function objects(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is Record<string, unknown> =>
+          !!item && typeof item === "object" && !Array.isArray(item),
+      )
+    : []
 }

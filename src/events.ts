@@ -1,4 +1,5 @@
 import type { ApiEvent } from "./api.ts"
+import { redact } from "./log.ts"
 
 /**
  * Reading a session's events. An event is `{event_type, payload, …}`, and
@@ -101,9 +102,12 @@ export function itemOf(event: ApiEvent): Item | undefined {
       }
     }
     case "user": {
-      // A tool's result comes back as a user message: passed over.
+      // Only what a person sent: never a tool's result (a user message
+      // too), a subagent's prompt, or what Claude Code adds itself (meta
+      // and synthetic messages, compact summaries, command output).
+      if (!personSent(payload)) return undefined
       const text = texts(payload.message)
-      if (!text) return undefined
+      if (!text || SYNTHETIC_TEXT.test(text)) return undefined
       return { ...meta(event), kind: "user", text: clean(text, MAX_ITEM_CHARS) }
     }
     case "result": {
@@ -124,6 +128,24 @@ export function itemOf(event: ApiEvent): Item | undefined {
   }
 }
 
+/** Text Claude Code writes into a user message itself, by its opening. */
+const SYNTHETIC_TEXT =
+  /^\s*(?:<(?:bash-stdout|bash-stderr|bash-input|local-command-stdout|local-command-stderr|local-command-caveat|command-name|command-message|command-args|system-reminder|user-prompt-submit-hook|task-notification)\b|This session is being continued from a previous conversation)/
+
+/** Whether a user message is one a person sent. */
+function personSent(payload: Obj): boolean {
+  if (payload.isMeta === true || payload.isSynthetic === true) return false
+  if (payload.isCompactSummary === true) return false
+  if (payload.isVisibleInTranscriptOnly === true) return false
+  if (
+    payload.parent_tool_use_id !== undefined &&
+    payload.parent_tool_use_id !== null
+  )
+    return false
+  if (payload.tool_use_result !== undefined) return false
+  return true
+}
+
 const TURN_ENDS = new Set(["result", "prompt_suggestion"])
 const ACTIVITY = new Set(["assistant", "user"])
 
@@ -138,7 +160,7 @@ export function stateOf(
   newestFirst: ApiEvent[],
   session: Record<string, unknown> = {},
 ): State {
-  const status = session.session_status ?? session.status
+  const status = session.status ?? session.session_status
   if (status === "archived") return "done"
   if (session.worker_status === "requires_action") return "needs_permission"
   for (const event of newestFirst) {
@@ -216,4 +238,54 @@ export function answerOf(
   const answer = textIn(response.response ?? response, 0)
   if (!answer) return { ok: false, error: "The session answered nothing." }
   return { ok: true, answer: clean(answer, MAX_ANSWER_CHARS) }
+}
+
+/** A permission prompt a session waits on, as the owner is shown it. */
+export type PendingPermission = {
+  request_id: string
+  /** The tool it wants to use. */
+  tool: string
+  /** What it wants to do, in the session's words, masked and cut short. */
+  description: string | null
+  /** The command or file it names, masked and cut short. */
+  target: string | null
+}
+
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_:.-]{0,127}$/
+const REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/
+
+function shown(value: unknown, max: number): string | null {
+  if (typeof value !== "string" || !value.trim()) return null
+  return redact(clean(value.trim(), max))
+}
+
+/**
+ * The permission prompt the session's record says it waits on
+ * (`worker_status` requires_action, `external_metadata.pending_action`),
+ * or undefined. Never the tool's whole input: its description, and the
+ * command or file it names, masked.
+ */
+export function pendingPermission(
+  session: Record<string, unknown>,
+): PendingPermission | undefined {
+  if (session.worker_status !== "requires_action") return undefined
+  const pending = obj(obj(session.external_metadata)?.pending_action)
+  if (!pending) return undefined
+  const requestId = pending.request_id
+  if (typeof requestId !== "string" || !REQUEST_ID.test(requestId))
+    return undefined
+  const tool = [pending.display_tool_name, pending.tool_name].find(
+    (name): name is string => typeof name === "string" && TOOL_NAME.test(name),
+  )
+  const input = obj(pending.input)
+  return {
+    request_id: requestId,
+    tool: tool ?? "a tool",
+    description: shown(pending.action_description, 300),
+    target:
+      shown(input?.command, 300) ??
+      shown(input?.file_path, 300) ??
+      shown(input?.url, 300) ??
+      shown(input?.path, 300),
+  }
 }

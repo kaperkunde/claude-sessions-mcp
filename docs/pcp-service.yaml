@@ -1,7 +1,7 @@
 pcp_format: 4
 version: 1
 name: Claude Code sessions
-description: "Your Claude Code cloud sessions (claude.ai/code), on your own claude.ai login: list them, see what one is doing, ask it a side question as /btw does (nothing added to its conversation), send it a message, interrupt it, or start a new one on a repository. As an MCP server with 9 tools: 4 read, 5 write. You sign in on PCP's pages; the login stays in the service's volume and no tool answers a token. It uses Claude Code's unofficial sessions API: for your own use only, never for other people's accounts."
+description: "Your Claude Code cloud sessions (claude.ai/code), on your own claude.ai login: list them, see what one is doing, ask it a side question as /btw does (nothing added to its conversation), send it a message, interrupt it, answer its permission prompts, archive or rename it, or start a new one on a repository. As an MCP server with 15 tools: 6 read, 9 write. You sign in on PCP's pages; the login stays in the service's volume and no tool answers a token. It uses Claude Code's unofficial sessions API: for your own use only, never for other people's accounts."
 image: ghcr.io/kaperkunde/claude-sessions-mcp@sha256:0000000000000000000000000000000000000000000000000000000000000000
 source: ghcr.io/kaperkunde/claude-sessions-mcp:latest
 ports:

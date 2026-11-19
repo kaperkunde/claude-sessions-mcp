@@ -1,5 +1,13 @@
 import { randomBytes } from "node:crypto"
-import { readFileSync, renameSync, writeFileSync } from "node:fs"
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs"
 import { join } from "node:path"
 
 import type { Transport } from "./egress.ts"
@@ -28,6 +36,8 @@ import type { Serial } from "./serial.ts"
 export const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 /** Renew when less than this is left of the access token. */
 export const REFRESH_MARGIN_MS = 5 * 60 * 1000
+/** How long a renewal request may take, all of it. */
+export const RENEWAL_TIMEOUT_MS = 20_000
 
 export type OAuthTokens = {
   accessToken: string
@@ -57,7 +67,10 @@ export class RenewalError extends Error {
 export const CREDENTIALS_FILE = ".credentials.json"
 export const ACCOUNT_FILE = ".claude.json"
 
-function readJson(file: string): Record<string, unknown> | undefined {
+/** A JSON file as an object; "unreadable" for one that does not parse. */
+function readJsonFile(
+  file: string,
+): Record<string, unknown> | undefined | "unreadable" {
   let text: string
   try {
     text = readFileSync(file, "utf8")
@@ -68,11 +81,28 @@ function readJson(file: string): Record<string, unknown> | undefined {
     const value: unknown = JSON.parse(text)
     return value && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
-      : undefined
+      : "unreadable"
   } catch {
-    return undefined
+    return "unreadable"
   }
 }
+
+function readJson(file: string): Record<string, unknown> | undefined {
+  const value = readJsonFile(file)
+  return value === "unreadable" ? undefined : value
+}
+
+/** A file the CLI may be writing as we read it: read once more. */
+async function readSettled(
+  file: string,
+): Promise<Record<string, unknown> | undefined> {
+  const first = readJsonFile(file)
+  if (first !== "unreadable") return first
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  return readJson(file)
+}
+
+type Fresh = { accessToken: string; organizationUuid: string }
 
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
@@ -86,7 +116,12 @@ export type CredentialsOptions = {
   now?: () => number
 }
 
+const LOST_RENEWAL =
+  "Renewing the claude.ai sign-in got no answer, and claude.ai may have renewed it all the same, which leaves this service with a used-up sign-in. Sign in again with login_start."
+
 export class Credentials {
+  /** A refresh token whose renewal got no answer: never sent again. */
+  private lostRefresh: string | undefined
   readonly dir: string
   readonly serial: Serial
   private readonly transport: Transport
@@ -106,8 +141,9 @@ export class Credentials {
   }
 
   /** The login as the file has it now, or undefined. */
-  tokens(): OAuthTokens | undefined {
-    const file = readJson(this.credentialsFile)
+  tokens(
+    file: Record<string, unknown> | undefined = readJson(this.credentialsFile),
+  ): OAuthTokens | undefined {
     const oauth = file?.claudeAiOauth
     if (!oauth || typeof oauth !== "object") return undefined
     const o = oauth as Record<string, unknown>
@@ -138,25 +174,47 @@ export class Credentials {
   }
 
   /**
-   * A usable access token and the organization it acts for. Renews first
-   * when the token is about to run out, or when `rejected` (a token the API
-   * just refused) is still the one on file.
+   * A usable access token and the organization it acts for. A token on
+   * file that is not about to run out (and is not `rejected`, a token the
+   * API just refused) is read outside the queue, so API calls never wait
+   * behind a CLI run; only a renewal takes its place in the queue.
    */
-  token(
-    rejected?: string,
-  ): Promise<{ accessToken: string; organizationUuid: string }> {
+  async token(rejected?: string): Promise<Fresh> {
+    const file = await readSettled(this.credentialsFile)
+    const ready = this.usable(this.tokens(file), rejected, REFRESH_MARGIN_MS)
+    if (ready) return ready
     return this.serial.run(() => this.tokenInLine(rejected))
   }
 
+  /** The token on file and its organization, if it needs no renewal. */
+  private usable(
+    tokens: OAuthTokens | undefined,
+    rejected: string | undefined,
+    marginMs: number,
+  ): Fresh | undefined {
+    if (!tokens) return undefined
+    const organizationUuid = this.account().organizationUuid
+    if (!organizationUuid) return undefined
+    if (rejected !== undefined && rejected === tokens.accessToken)
+      return undefined
+    if (
+      tokens.expiresAt !== undefined &&
+      tokens.expiresAt - this.now() < marginMs
+    )
+      return undefined
+    return { accessToken: tokens.accessToken, organizationUuid }
+  }
+
   /**
-   * As token(), for a caller already in the Serial's line (cli.ts, before
-   * it runs the CLI, so the CLI finds a fresh token and does not renew it
-   * itself while it runs).
+   * As token(), for a caller already in the Serial's line. cli.ts passes a
+   * margin as long as its run may take, so the CLI finds a token that lasts
+   * the whole run and never renews it itself meanwhile.
    */
   async tokenInLine(
     rejected?: string,
-  ): Promise<{ accessToken: string; organizationUuid: string }> {
-    const tokens = this.tokens()
+    marginMs: number = REFRESH_MARGIN_MS,
+  ): Promise<Fresh> {
+    const tokens = this.tokens(await readSettled(this.credentialsFile))
     if (!tokens) {
       throw new SignedOut(
         "The service is not signed in to claude.ai. Sign in with login_start (see its description).",
@@ -168,12 +226,9 @@ export class Credentials {
         "The sign-in names no organization. Sign in again with login_start.",
       )
     }
-    const expiring =
-      tokens.expiresAt !== undefined &&
-      tokens.expiresAt - this.now() < REFRESH_MARGIN_MS
-    if (expiring || (rejected !== undefined && rejected === tokens.accessToken))
-      return { accessToken: await this.renew(tokens), organizationUuid }
-    return { accessToken: tokens.accessToken, organizationUuid }
+    const ready = this.usable(tokens, rejected, marginMs)
+    if (ready) return ready
+    return { accessToken: await this.renew(tokens), organizationUuid }
   }
 
   private async renew(tokens: OAuthTokens): Promise<string> {
@@ -181,6 +236,11 @@ export class Credentials {
       throw new SignedOut(
         "The sign-in cannot be renewed. Sign in again with login_start.",
       )
+    }
+    if (tokens.refreshToken === this.lostRefresh) {
+      // Sent once already, and the answer was lost: claude.ai may have
+      // rotated it, and a refresh token sent twice can end the login.
+      throw new SignedOut(LOST_RENEWAL)
     }
     const body: Record<string, string> = {
       grant_type: "refresh_token",
@@ -190,16 +250,24 @@ export class Credentials {
     if (tokens.scopes && tokens.scopes.length > 0)
       body.scope = tokens.scopes.join(" ")
     const started = this.now()
-    const response = await this.transport({
-      host: "auth",
-      method: "POST",
-      path: "/v1/oauth/token",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(body),
-    })
+    let response
+    try {
+      response = await this.transport({
+        host: "auth",
+        method: "POST",
+        path: "/v1/oauth/token",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(body),
+        timeoutMs: RENEWAL_TIMEOUT_MS,
+      })
+    } catch {
+      this.lostRefresh = tokens.refreshToken
+      this.logger.warn("login_renewal_lost")
+      throw new SignedOut(LOST_RENEWAL)
+    }
     this.logger.info("login_renewal", {
       status: response.status,
       ms: this.now() - started,
@@ -235,7 +303,7 @@ export class Credentials {
 
   /**
    * Writes the renewed tokens into the CLI's file, keeping every other
-   * field as it was: whole, mode 0600, by a rename.
+   * field as it was: whole, mode 0600, on disk (fsync) before the rename.
    */
   private write(update: Pick<OAuthTokens, "accessToken"> & OAuthTokens) {
     const file = readJson(this.credentialsFile) ?? {}
@@ -253,7 +321,22 @@ export class Credentials {
       },
     }
     const part = `${this.credentialsFile}.${randomBytes(6).toString("hex")}.part`
-    writeFileSync(part, JSON.stringify(next), { mode: 0o600 })
-    renameSync(part, this.credentialsFile)
+    let fd: number | undefined
+    try {
+      fd = openSync(part, "wx", 0o600)
+      writeSync(fd, JSON.stringify(next))
+      fsyncSync(fd)
+      closeSync(fd)
+      fd = undefined
+      renameSync(part, this.credentialsFile)
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd)
+      try {
+        unlinkSync(part)
+      } catch {
+        // already gone
+      }
+      throw error
+    }
   }
 }

@@ -38,6 +38,8 @@ type FakeSession = {
   silent?: boolean
   pending: { requestId: string; due: number; response: unknown }[]
   polls: number
+  /** Events the session writes right after it answers (a busy session). */
+  noiseAfterAnswer: number
 }
 
 function json(status: number, body: unknown): IncomingResponse {
@@ -66,6 +68,18 @@ export class FakeAnthropic {
   /** Answer the next N API calls 401 whatever the token. */
   force401 = 0
   sessions = new Map<string, FakeSession>()
+  environments: Record<string, unknown>[] = [
+    {
+      kind: "anthropic_cloud",
+      environment_id: "env_01DefaultCloud",
+      name: "Default",
+    },
+    {
+      kind: "anthropic_cloud",
+      environment_id: "env_02NodeHeavy",
+      name: "Node, more memory",
+    },
+  ]
   private seq = 1000
   private readonly now: () => number
 
@@ -78,14 +92,21 @@ export class FakeAnthropic {
     id: string,
     record: Record<string, unknown> = {},
     options: Partial<
-      Pick<FakeSession, "deviceBound" | "answerAfterPolls" | "silent">
+      Pick<
+        FakeSession,
+        "deviceBound" | "answerAfterPolls" | "silent" | "noiseAfterAnswer"
+      >
     > = {},
   ) {
     this.sessions.set(id, {
       record: {
         id,
         title: `Session ${id}`,
-        session_status: "active",
+        status: "active",
+        worker_status: "idle",
+        environment_id: "env_01DefaultCloud",
+        environment_kind: "anthropic_cloud",
+        created_at: "2026-11-18T16:00:00Z",
         updated_at: "2026-11-18T17:00:00Z",
         config: {
           sources: [
@@ -103,6 +124,7 @@ export class FakeAnthropic {
       silent: options.silent,
       pending: [],
       polls: 0,
+      noiseAfterAnswer: options.noiseAfterAnswer ?? 0,
     })
   }
 
@@ -169,7 +191,16 @@ export class FakeAnthropic {
     if (h["x-organization-uuid"] !== ORG) return error(403, "organization")
 
     const url = new URL(request.path, "https://api.invalid")
-    const parts = url.pathname.split("/").filter(Boolean) // v1 code sessions [id] [events]
+    if (url.pathname === "/v1/environment_providers") {
+      if (request.method !== "GET") return error(405, "method")
+      const limit = Number(url.searchParams.get("limit") ?? "20")
+      return json(200, {
+        environments: this.environments.slice(0, limit),
+        has_more: false,
+        last_id: this.environments.at(-1)?.environment_id ?? null,
+      })
+    }
+    const parts = url.pathname.split("/").filter(Boolean) // v1 code sessions [id] [events|archive|unarchive]
     if (parts.length === 3 && request.method === "GET") {
       const limit = Number(url.searchParams.get("limit") ?? "20")
       const data = [...this.sessions.values()]
@@ -182,6 +213,28 @@ export class FakeAnthropic {
     if (!session) return error(404, "session not found")
     if (parts.length === 4 && request.method === "GET")
       return json(200, session.record)
+    if (parts.length === 4 && request.method === "PUT") {
+      const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>
+      if (
+        Object.keys(body).join() !== "title" ||
+        typeof body.title !== "string"
+      )
+        return error(400, "only title")
+      session.record.title = body.title
+      return json(200, session.record)
+    }
+    if (parts[4] === "archive" && request.method === "POST") {
+      if (session.record.status === "archived")
+        return error(409, "already archived")
+      session.record.status = "archived"
+      return json(200, {})
+    }
+    if (parts[4] === "unarchive" && request.method === "POST") {
+      if (session.deviceBound)
+        return error(403, "untrusted device: elevated auth required")
+      session.record.status = "active"
+      return json(200, {})
+    }
     if (parts[4] !== "events") return error(404, "not found")
     if (request.method === "GET") {
       session.polls++
@@ -190,12 +243,30 @@ export class FakeAnthropic {
           type: "control_response",
           response: p.response,
         })
+        for (let i = 0; i < session.noiseAfterAnswer; i++)
+          this.addEvent(id, {
+            type: "assistant",
+            message: { content: [{ type: "text", text: `noise ${i}` }] },
+          })
       }
       session.pending = session.pending.filter((p) => p.due > session.polls)
-      const limit = Number(url.searchParams.get("limit") ?? "20")
+      const limit = Number(url.searchParams.get("limit") ?? "100")
       const desc = url.searchParams.get("sort_order") === "desc"
-      const events = desc ? [...session.events].reverse() : session.events
-      return json(200, { data: events.slice(0, limit) })
+      const cursor = url.searchParams.get("cursor")
+      const at = cursor === null ? undefined : Number(cursor)
+      const all = desc
+        ? [...session.events]
+            .reverse()
+            .filter((e) => at === undefined || (e.sequence_num as number) < at)
+        : session.events.filter(
+            (e) => at === undefined || (e.sequence_num as number) > at,
+          )
+      const page = all.slice(0, limit)
+      const more = all.length > page.length
+      return json(200, {
+        data: page,
+        next_cursor: more ? String(page.at(-1)!.sequence_num) : null,
+      })
     }
     // POST events
     const body = JSON.parse(request.body ?? "{}") as {
@@ -212,6 +283,20 @@ export class FakeAnthropic {
     for (const e of body.events) {
       const payload = e.payload ?? {}
       if (e.event_type === "user") {
+        this.addEvent(id, payload)
+        continue
+      }
+      if (e.event_type === "control_response") {
+        const response = payload.response as Record<string, unknown>
+        const pending = (
+          session.record.external_metadata as
+            { pending_action?: { request_id?: string } } | undefined
+        )?.pending_action
+        if (pending && response.request_id === pending.request_id) {
+          session.record.worker_status = "running"
+          delete (session.record.external_metadata as Record<string, unknown>)
+            .pending_action
+        }
         this.addEvent(id, payload)
         continue
       }
@@ -241,6 +326,41 @@ export class FakeAnthropic {
       }
     }
     return json(200, {})
+  }
+
+  /** Puts a permission prompt on a session, as a worker waiting on one. */
+  askPermission(
+    id: string,
+    prompt: {
+      requestId: string
+      toolName: string
+      description: string
+      input: Record<string, unknown>
+    },
+  ) {
+    const session = this.sessions.get(id)!
+    session.record.worker_status = "requires_action"
+    session.record.external_metadata = {
+      ...(session.record.external_metadata as object | undefined),
+      pending_action: {
+        request_id: prompt.requestId,
+        tool_use_id: `toolu_${prompt.requestId}`,
+        tool_name: prompt.toolName,
+        display_tool_name: prompt.toolName,
+        action_description: prompt.description,
+        input: prompt.input,
+      },
+    }
+    this.addEvent(id, {
+      type: "control_request",
+      request_id: prompt.requestId,
+      request: {
+        subtype: "can_use_tool",
+        tool_name: prompt.toolName,
+        tool_use_id: `toolu_${prompt.requestId}`,
+        input: prompt.input,
+      },
+    })
   }
 }
 

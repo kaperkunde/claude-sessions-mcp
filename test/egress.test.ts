@@ -96,6 +96,10 @@ describe("egress", () => {
     ["api", "/v1/code/sessions/cse_1?x=a b"],
     ["api", "/v1/code/sessions\r\nHost: evil.example"],
     ["api", "/v1/oauth/token"],
+    ["api", "/v1/code/sessions/cse_1/delete"],
+    ["api", "/v1/code/sessions/cse_1/archive/x"],
+    ["api", "/v1/environment_providers/x"],
+    ["api", "/v1/code/triggers"],
     ["auth", "/v1/code/sessions"],
     ["auth", "/v1/oauth/token?x=1"],
   ])("refuses %s %j before it dials", async (host, path) => {
@@ -128,6 +132,19 @@ describe("egress", () => {
       ),
     ).toBe(true)
     expect(safePath("auth", "/v1/oauth/token")).toBe(true)
+    expect(safePath("api", "/v1/code/sessions/cse_0123456789/archive")).toBe(
+      true,
+    )
+    expect(safePath("api", "/v1/code/sessions/cse_0123456789/unarchive")).toBe(
+      true,
+    )
+    expect(
+      safePath(
+        "api",
+        "/v1/code/sessions/cse_0123456789/events?limit=100&sort_order=asc&cursor=1042",
+      ),
+    ).toBe(true)
+    expect(safePath("api", "/v1/environment_providers?limit=50")).toBe(true)
   })
 
   it("checks certificates, said outright", () => {

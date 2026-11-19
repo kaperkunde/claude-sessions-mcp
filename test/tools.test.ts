@@ -36,7 +36,7 @@ function busySession(s: ReturnType<typeof setup>) {
 }
 
 describe("the tools", () => {
-  it("are nine, read tools marked read-only and the rest not", () => {
+  it("are fifteen, read tools marked read-only and the rest not", () => {
     const s = setup()
     const specs = toolSpecs(s.deps)
     const tiers = Object.fromEntries(
@@ -44,12 +44,18 @@ describe("the tools", () => {
     )
     expect(tiers).toEqual({
       list_sessions: true,
+      get_session: true,
       session_status: true,
       ask_session: true,
+      list_environments: true,
       login_status: true,
       send_message: false,
       interrupt_session: false,
+      answer_permission: false,
       start_session: false,
+      archive_session: false,
+      unarchive_session: false,
+      rename_session: false,
       login_start: false,
       login_finish: false,
     })
@@ -72,7 +78,7 @@ describe("the tools", () => {
   it("list_sessions sends the API's headers and leaves archived ones out", async () => {
     const s = setup()
     s.fake.addSession(ID)
-    s.fake.addSession("cse_archived000001", { session_status: "archived" })
+    s.fake.addSession("cse_archived000001", { status: "archived" })
     const answer = await s.ok("list_sessions")
     expect(answer.sessions).toEqual([
       {
@@ -145,7 +151,7 @@ describe("the tools", () => {
     expect((await s.ok("session_status", { session_id: ID })).state).toBe(
       "needs_permission",
     )
-    s.fake.sessions.get(ID)!.record.session_status = "archived"
+    s.fake.sessions.get(ID)!.record.status = "archived"
     expect((await s.ok("session_status", { session_id: ID })).state).toBe(
       "done",
     )

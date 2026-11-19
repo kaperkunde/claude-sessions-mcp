@@ -5,7 +5,7 @@
 // Every run is recorded in <CLAUDE_CONFIG_DIR>/fake-cli-runs.jsonl.
 //
 // The first argument may be --fake-mode=<mode>: no-url, cloud-fail,
-// cloud-text, slow.
+// cloud-text, slow (a sign-in that takes 1.5 s to finish).
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { createInterface } from "node:readline"
@@ -23,6 +23,7 @@ function record(entry) {
     join(dir, "fake-cli-runs.jsonl"),
     JSON.stringify({
       args,
+      pid: process.pid,
       cwd: process.cwd(),
       env: Object.keys(process.env).sort(),
       ...entry,
@@ -59,6 +60,7 @@ if (args[0] === "auth" && args[1] === "login") {
       continue
     }
     if (line === GOOD_CODE) {
+      if (mode === "slow") await new Promise((r) => setTimeout(r, 1500))
       writeFileSync(
         join(dir, ".credentials.json"),
         JSON.stringify({
