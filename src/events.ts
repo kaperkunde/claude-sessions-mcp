@@ -428,6 +428,9 @@ export const MAX_ANSWER_TOTAL_CHARS = 32768
 /** Control characters but a line break: text that shows otherwise. */
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/
+/** As CONTROL, but a preview (often code) may hold tabs and CRLF line ends. */
+// eslint-disable-next-line no-control-regex
+const PREVIEW_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/
 
 /** A question's own text, exactly as asked; undefined if it is not one. */
 function exact(value: unknown): string | undefined {
@@ -492,13 +495,15 @@ function readQuestions(
   const shownText = questions.flatMap((q) => [
     q.question,
     q.header ?? "",
-    ...q.options.flatMap((o) => [
-      o.label,
-      o.description ?? "",
-      o.preview ?? "",
-    ]),
+    ...q.options.flatMap((o) => [o.label, o.description ?? ""]),
   ])
-  if (shownText.some((text) => CONTROL.test(text)))
+  const previews = questions.flatMap((q) =>
+    q.options.map((o) => o.preview ?? ""),
+  )
+  if (
+    shownText.some((text) => CONTROL.test(text)) ||
+    previews.some((text) => PREVIEW_CONTROL.test(text))
+  )
     return {
       reason:
         "The questions have characters that do not show as they are (control characters).",
