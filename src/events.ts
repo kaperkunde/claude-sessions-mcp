@@ -165,8 +165,8 @@ const ACTIVITY = new Set(["assistant", "user"])
 /**
  * What the session is doing, from its newest events (newest first) and
  * its own record: done when archived; needs_answer when it waits on a
- * question (QUESTION_TOOL), needs_permission when it waits on any other
- * permission prompt; stalled when its worker runs but lost contact (the
+ * question (QUESTION_TOOL, read by pendingAction), needs_permission when
+ * it waits on any other permission prompt or one it cannot read; stalled when its worker runs but lost contact (the
  * CLI's own "lost contact with the cloud environment": worker running,
  * connection disconnected); waiting when its newest turn ended (a result
  * or a prompt suggestion is newer than any message); working when a
@@ -179,10 +179,11 @@ export function stateOf(
   const status = session.status ?? session.session_status
   if (status === "archived") return "done"
   if (session.worker_status === "requires_action") {
-    const pending = obj(obj(session.external_metadata)?.pending_action)
-    return pending?.tool_name === QUESTION_TOOL
-      ? "needs_answer"
-      : "needs_permission"
+    // The same prompt pending_question and pending_permission read: a
+    // question only when it can be shown as one, else (one it cannot read
+    // included) needs_permission, as before questions were told apart.
+    const action = pendingAction(session)
+    return action && isQuestion(action) ? "needs_answer" : "needs_permission"
   }
   if (
     session.worker_status === "running" &&
@@ -392,14 +393,32 @@ export type QuestionView = {
   questions: {
     question: string
     header: string | null
+    /**
+     * How it is answered: choice (among its options, the default), text
+     * or number (words or a number of the owner's, no options).
+     */
+    kind: QuestionKind
     multi_select: boolean
-    options: { label: string; description: string | null }[]
+    options: {
+      label: string
+      description: string | null
+      /** What the option would look like (code, a mock-up), as asked. */
+      preview: string | null
+    }[]
   }[]
   /** Why the questions are not shown (and cannot be answered here). */
   input_withheld: string | null
 }
 
 type Question = QuestionView["questions"][number]
+
+/** How a question is answered, as the CLI's tool takes `kind`. */
+export const QUESTION_KINDS = ["choice", "text", "number"] as const
+export type QuestionKind = (typeof QUESTION_KINDS)[number]
+
+function isKind(value: unknown): value is QuestionKind {
+  return (QUESTION_KINDS as readonly unknown[]).includes(value)
+}
 
 /** The most questions one prompt asks, as the CLI's tool takes them. */
 export const MAX_QUESTIONS = 4
@@ -417,8 +436,10 @@ function exact(value: unknown): string | undefined {
 
 /**
  * The questions in a question prompt's input ({questions: [{question,
- * header, options: [{label, description}], multiSelect}]}), exactly as
- * asked, or why they cannot be shown.
+ * header, kind, options: [{label, description, preview}], multiSelect}]}),
+ * exactly as asked, or why they cannot be shown. A text or number
+ * question has no options and is not multiSelect, as the CLI's tool
+ * takes it; a kind it does not know cannot be read.
  */
 function readQuestions(
   input: Record<string, unknown>,
@@ -436,16 +457,24 @@ function readQuestions(
       return unreadable
     if (q.multiSelect !== undefined && typeof q.multiSelect !== "boolean")
       return unreadable
-    if (!Array.isArray(q.options)) return unreadable
+    const kind = q.kind ?? "choice"
+    if (!isKind(kind)) return unreadable
+    const rawOptions = q.options ?? (kind === "choice" ? undefined : [])
+    if (!Array.isArray(rawOptions)) return unreadable
+    if (kind !== "choice" && (rawOptions.length > 0 || q.multiSelect === true))
+      return unreadable
     const options: Question["options"] = []
-    for (const o of q.options.map(obj)) {
+    for (const o of rawOptions.map(obj)) {
       const label = exact(o?.label)
       if (!o || !label) return unreadable
       if (o.description !== undefined && typeof o.description !== "string")
         return unreadable
+      if (o.preview !== undefined && typeof o.preview !== "string")
+        return unreadable
       options.push({
         label,
         description: (o.description as string | undefined) ?? null,
+        preview: (o.preview as string | undefined) ?? null,
       })
     }
     if (new Set(options.map((o) => o.label)).size !== options.length)
@@ -453,6 +482,7 @@ function readQuestions(
     questions.push({
       question,
       header: (q.header as string | undefined) ?? null,
+      kind,
       multi_select: q.multiSelect === true,
       options,
     })
@@ -462,7 +492,11 @@ function readQuestions(
   const shownText = questions.flatMap((q) => [
     q.question,
     q.header ?? "",
-    ...q.options.flatMap((o) => [o.label, o.description ?? ""]),
+    ...q.options.flatMap((o) => [
+      o.label,
+      o.description ?? "",
+      o.preview ?? "",
+    ]),
   ])
   if (shownText.some((text) => CONTROL.test(text)))
     return {
@@ -518,8 +552,11 @@ export function joinChoices(choices: string[]): string {
 /**
  * The answers to send ({question text: answer}) for the questions shown,
  * or why they cannot be sent: every question answered once, by its exact
- * text; choices among its labels, one unless it is multi_select; or a
- * free text (the "Other" answer) alone; within the CLI's length.
+ * text; a choice question with choices among its labels (one unless it
+ * is multi_select) or a free text (the "Other" answer), the text alone
+ * unless it is multi_select, where it joins the choices as one more item
+ * (the CLI takes up to its options and one); a text or number question
+ * with text only; within the CLI's length.
  */
 export function questionAnswers(
   questions: Question[],
@@ -541,22 +578,36 @@ export function questionAnswers(
       )
     const choices = given.choices ?? []
     const text = given.text
-    if (text !== undefined && choices.length > 0)
+    if (question.kind !== "choice" && choices.length > 0)
       return fail(
-        `text is the free answer and goes alone: answer ${quote(question.question)} with choices or text, not both.`,
+        `${quote(question.question)} is a ${question.kind} question with no options: answer it with text only.`,
+      )
+    if (text !== undefined && choices.length > 0 && !question.multi_select)
+      return fail(
+        `text is the free answer and goes alone: answer ${quote(question.question)} with choices or text, not both (both only on a multi_select question).`,
       )
     if (text !== undefined) {
       if (!text.trim())
-        return fail(`Answer ${quote(question.question)} with choices or text.`)
+        return fail(
+          question.kind === "choice"
+            ? `Answer ${quote(question.question)} with choices or text.`
+            : `Answer ${quote(question.question)} with text.`,
+        )
       if (CONTROL.test(text) || FORMAT.test(text))
         return fail(
           `The answer to ${quote(question.question)} has characters that do not show as they are (control, bidi or zero-width).`,
         )
-      out[question.question] = text
-      continue
+      if (choices.length === 0) {
+        out[question.question] = text
+        continue
+      }
     }
     if (choices.length === 0)
-      return fail(`Answer ${quote(question.question)} with choices or text.`)
+      return fail(
+        question.kind === "choice"
+          ? `Answer ${quote(question.question)} with choices or text.`
+          : `Answer ${quote(question.question)} with text.`,
+      )
     const labels = question.options.map((o) => o.label)
     const unknown = choices.find((c) => !labels.includes(c))
     if (unknown !== undefined)
@@ -570,7 +621,7 @@ export function questionAnswers(
         `${quote(question.question)} takes one choice (it is not multi_select).`,
       )
     out[question.question] = question.multi_select
-      ? joinChoices(choices)
+      ? joinChoices(text === undefined ? choices : [...choices, text])
       : choices[0]!
   }
   const missing = questions.find((q) => !Object.hasOwn(out, q.question))

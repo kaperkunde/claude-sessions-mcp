@@ -83,6 +83,9 @@ what you allow. It reads the session again first and refuses when that
 prompt is no longer the one it waits on, and it answers a prompt once:
 the service remembers the prompts it answered (the newest 1,000) and
 refuses a second answer, even while the record still shows the prompt.
+A prompt is claimed before the session is read, so two answers sent at
+once post once, and given back when the answer is refused or does not go
+in.
 
 ### Questions
 
@@ -91,22 +94,32 @@ to four questions, each with a short heading and options), its worker is
 `requires_action` on a prompt for that tool. `session_status` and
 `get_session` then show it as `pending_question`, never as
 `pending_permission`: the prompt's `request_id` and each question exactly
-as asked, with its `header`, whether it is `multi_select`, and its
-options (`label`, `description`). The questions are withheld
-(`questions` empty, `input_withheld` says why) on the same rules as a
-permission prompt's input: unreadable, longer than 4,000 characters,
-secret-looking, or with characters that do not show as they are. Withheld
-questions can only be declined from here.
+as asked, with its `header`, its `kind` (`choice`, the default, among its
+options; `text` or `number`, the owner's own words, no options), whether
+it is `multi_select`, and its options (`label`, `description`,
+`preview`). The questions are withheld (`questions` empty,
+`input_withheld` says why) on the same rules as a permission prompt's
+input, previews included: unreadable (a `kind` it does not know, or a
+text or number question with options, among them), longer than 4,000
+characters, secret-looking, or with characters that do not show as they
+are. Withheld questions can only be declined from here.
 
 `answer_question` answers as the CLI does, with the same
 `control_response`: `{behavior:"allow", updatedInput:{…the input as
 asked, answers}}`, where `answers` maps each question's text to its
 answer: a label, several labels joined as the CLI joins them (`, `
 between, a label holding `, ` or `"` written as a JSON string), or your
-own words (`text`, the "Other" answer, alone). With `decline` it sends
-`{behavior:"deny", message}`. Before anything is sent it checks that the
+own words (`text`, the "Other" answer: alone, or on a `multi_select`
+question joined after the labels as one more item, as the CLI takes up to
+its options and one). A `text` or `number` question takes `text` only.
+With `decline` it sends `{behavior:"deny", message}`. Both carry
+`toolUseID` when the prompt has a `tool_use_id`, as `answer_permission`'s
+do. Before anything is sent it checks that the
 prompt is still the one the session waits on, that it was not answered
-from here before (the same memory as `answer_permission`), that every
+from here before or is not being answered now (the same memory as
+`answer_permission`, claimed before anything is read, so two calls at
+once post once, and given back when the answer is refused or does not go
+in), that every
 question is answered exactly once by its exact text, that each choice is
 one of that question's labels and only one unless `multi_select`, and that
 the answers stay within the 32,768 characters the CLI takes.
@@ -123,8 +136,8 @@ events:
 | State              | When                                                                                                                                                        |
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `done`             | It is archived.                                                                                                                                             |
-| `needs_answer`     | Its worker is `requires_action` on a question (`AskUserQuestion`): answer it with `answer_question`.                                                        |
-| `needs_permission` | Its worker is `requires_action` on any other permission prompt: answer it with `answer_permission`.                                                         |
+| `needs_answer`     | Its worker is `requires_action` on a question (`AskUserQuestion`) it can read: answer it with `answer_question`.                                            |
+| `needs_permission` | Its worker is `requires_action` on any other permission prompt, or on one it cannot read (then no `pending_…`: answer it on claude.ai/code).                |
 | `stalled`          | Its worker is `running` but its `connection_status` is `disconnected`: the CLI's "lost contact with the cloud environment". Nothing moves until it is back. |
 | `waiting`          | Its newest turn ended (a result or a prompt suggestion is newer than any message): it waits for a message.                                                  |
 | `working`          | A message is newer than the last turn's end.                                                                                                                |
@@ -279,7 +292,7 @@ x-organization-uuid: <oauthAccount.organizationUuid>
 | `send_message`      | the same POST with `event_type` `user`: `{type:"user", parent_tool_use_id:null, message:{role:"user", content}, priority?}`                                                                                                                                                                                                             |
 | `interrupt_session` | a `control_request` `{subtype:"interrupt", cancel_queued:true, spare_background_tasks:true, send_now:true}`, as the CLI sends it; its `control_response` awaited for 15 seconds                                                                                                                                                         |
 | `answer_permission` | a `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput, toolUseID, tool_name}}` or `{behavior:"deny", message, toolUseID}`, for the prompt in the record's `external_metadata.pending_action`                                                                                                   |
-| `answer_question`   | the same `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput:{…input, answers:{<question>: <answer>}}}}` or `{behavior:"deny", message}`, for a `pending_action` whose `tool_name` is `AskUserQuestion`                                                                                        |
+| `answer_question`   | the same `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput:{…input, answers:{<question>: <answer>}}, toolUseID}}` or `{behavior:"deny", message, toolUseID}`, for a `pending_action` whose `tool_name` is `AskUserQuestion`                                                                  |
 | `archive_session`   | `POST /v1/code/sessions/{id}/archive` with `{}` (409: it already was)                                                                                                                                                                                                                                                                   |
 | `unarchive_session` | `POST /v1/code/sessions/{id}/unarchive` with `{}`                                                                                                                                                                                                                                                                                       |
 | `rename_session`    | `PUT /v1/code/sessions/{id}` with `{"title": …}`                                                                                                                                                                                                                                                                                        |
