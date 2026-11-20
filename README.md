@@ -42,8 +42,8 @@ pinned in the image and why there is a smoke test to run after updating it
 | `archive_session`   | Write | **ask**         | Archives a session, as on claude.ai/code: it stops and leaves the list. Nothing is deleted.                                                                                                                                                                                                             |
 | `unarchive_session` | Write | **ask**         | Brings an archived session back. claude.ai may ask for a trusted device for this; it then says to do it on claude.ai/code.                                                                                                                                                                              |
 | `rename_session`    | Write | **ask**         | Sets a session's title (one line, up to 200 characters).                                                                                                                                                                                                                                                |
-| `login_start`       | Write | allowed         | Starts the claude.ai sign-in and answers the address you sign in at. Changes nothing until it is finished.                                                                                                                                                                                              |
-| `login_finish`      | Write | **blocked**     | Finishes the sign-in with your code. Only through the wrapper below, which hands it the code as a PCP secret.                                                                                                                                                                                           |
+| `login_start`       | Write | **blocked**     | Starts the claude.ai sign-in and answers the address you sign in at. PCP's own sign-in page calls it; an assistant asks with PCP's `connect_account`. Changes nothing until it is finished.                                                                                                             |
+| `login_finish`      | Write | **blocked**     | Finishes the sign-in with your code. Only PCP's own sign-in page calls it, with the code you paste there: allowed for that page alone, which goes by no token's level.                                                                                                                                  |
 
 Read tools state `readOnlyHint: true`, the others `false`; none is
 destructive. Every tool states all four annotations, takes a closed
@@ -155,81 +155,36 @@ instructions to the assistant reading it.
 
 The service needs a full claude.ai login (the scope
 `user:sessions:claude_code`); `claude setup-token`'s inference-only token
-cannot read sessions. You sign in once, on PCP's pages and claude.ai's;
-**the code claude.ai shows you never passes through an assistant.**
+cannot read sessions. You sign in once, on PCP's own sign-in page and
+claude.ai's; **the code claude.ai shows you never passes through an
+assistant.** The service's definition declares the sign-in (`signin` in
+[docs/pcp-service.yaml](docs/pcp-service.yaml)), so it is a step of PCP's
+own: no wrapper and no secret to make up.
 
-1. **An assistant calls `login_start`.** The service starts the CLI's own
-   sign-in (`claude auth login --claudeai`) inside the container, keeps it
-   running, and answers its sign-in address. The assistant hands you that
-   address as a link.
-2. **You sign in** at that address with your claude.ai account and approve.
-   The page then shows a code (`…#…`). Do not paste it into the chat.
-3. **You type the code into PCP's secret `claude_login_code`.** The first
-   time, the assistant asks for it with `request_secret`, and you type it on
-   PCP's page (or you type it when you approve the wrapper in step 4, which
-   names that secret). Later times, change the secret's value on PCP's
-   Secrets page.
-4. **The wrapper finishes the sign-in.** A PCP wrapper you approved once
-   (below) has one tool, `finish_claude_sign_in`, whose program calls
-   `login_finish` with `{"$secret": "claude_login_code"}` as its `code`. PCP
-   puts the code there itself, only for that tool and argument, and scrubs
-   it from the answer. The assistant calls `finish_claude_sign_in`; it
-   never sees the code.
-5. **`login_status`** then names the account and organization.
+1. **An assistant calls PCP's `connect_account`** with the service (or a
+   call fails because the service is signed out). PCP reads `login_status`
+   and, signed out, hands the assistant a link to PCP's sign-in page for
+   the service, **Sign in to Claude Code sessions in PCP**, which it gives
+   you. (The service's page in PCP links there too.)
+2. **On that page, PCP calls `login_start`** and shows claude.ai's sign-in
+   address, with its host. You open it, sign in with your claude.ai
+   account and approve. The page then shows a code (`…#…`).
+3. **You paste the code on PCP's page.** PCP hands it to `login_finish` in
+   that one call and keeps it nowhere: not stored, not in the request log,
+   not in an answer to the assistant, and taken out of any error.
+4. **PCP reads `login_status`** and shows the account you are signed in
+   as. On your next message, the assistant's `check_server` says the same.
 
 The sign-in waits 15 minutes for its code, and a code works once, within
-minutes, with the sign-in that showed it: if it fails, start again from
-step 1. A new `login_start` ends a sign-in still waiting. A finished
-sign-in replaces any earlier login of the service.
+minutes, with the sign-in that showed it. PCP's page starts a new sign-in
+by itself once one has run out, and **Start the sign-in again** does so
+after a code that did not work. A new `login_start` ends a sign-in still
+waiting. A finished sign-in replaces any earlier login of the service.
 
-### The wrapper to propose
-
-Once, before the first sign-in, an assistant proposes it with PCP's
-`create_wrapper` (replace `claude-code-sessions` with the short name PCP
-gave the service's MCP server):
-
-```json
-{
-  "name": "Claude sign-in",
-  "description": "Finishes the claude.ai sign-in of the Claude Code sessions service with the code you typed into the secret claude_login_code.",
-  "tools": [
-    {
-      "name": "finish_claude_sign_in",
-      "description": "Finish the claude.ai sign-in that login_start began, with the code the owner typed into PCP's secret claude_login_code. Takes no arguments: the code never passes through the assistant.",
-      "input_schema": {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-      },
-      "annotations": {
-        "readOnlyHint": false,
-        "destructiveHint": false,
-        "idempotentHint": false,
-        "openWorldHint": true
-      },
-      "program": "return await pcp.call(\"claude-code-sessions\", \"login_finish\", { code: { \"$secret\": \"claude_login_code\" } })",
-      "calls": ["claude-code-sessions/login_finish"],
-      "replaces": ["claude-code-sessions/login_finish"]
-    }
-  ],
-  "secrets": [
-    {
-      "secret": "claude_login_code",
-      "tool": "claude-code-sessions/login_finish",
-      "argument": "/code"
-    }
-  ],
-  "call_levels": "approved",
-  "tool_access": [
-    { "tools": ["finish_claude_sign_in"], "access": "allowed", "tier": "write" }
-  ]
-}
-```
-
-With `call_levels` `"approved"`, your approval of the wrapper is what lets
-it call `login_finish`, so `login_finish` itself can stay **blocked** for
-every token: no assistant can call it directly, with a code typed into a
-chat or otherwise.
+`login_finish` is called by PCP's own page, as your own action, not
+through any token: its level for tokens stays **blocked**, and so does
+`login_start`'s (an assistant's `login_start` would end a sign-in you are
+in the middle of). An assistant only ever gets the link.
 
 ## The login, and its renewal
 
@@ -349,14 +304,14 @@ the failures. Make the scratch session on claude.ai/code and leave it idle.
 
 ## Environment
 
-| Variable                           |                      | What it is                                                                                                                                                                                  |
-| ---------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MCP_AUTH_TOKEN`                   | **secret, required** | Every MCP request must send `Authorization: Bearer <token>`. PCP sends it for you (`registers.auth`). At least 16 characters. Without it the service does not start, unless `MCP_AUTH=off`. |
-| `MCP_AUTH`                         | plain, optional      | `off` serves the tools with no token, to anything that reaches the port; only for a test on a machine of your own.                                                                          |
-| `MCP_ALLOWED_HOSTS`                | plain, optional      | `Host` values accepted besides loopback, comma separated (`192.0.2.10:8080`, `host:*`, `*`): the address you publish on, if it is not 127.0.0.1.                                            |
-| `CLAUDE_CONFIG_DIR`                |                      | The CLI's config folder, holding the login: `/home/claude/.claude`, a named volume.                                                                                                         |
-| `CLAUDE_BIN`                       |                      | The CLI: `/usr/local/bin/claude`.                                                                                                                                                           |
-| `MCP_PORT`, `MCP_HOST`, `MCP_PATH` |                      | Where it listens: `8080`, `0.0.0.0` (inside the container), `/mcp`.                                                                                                                         |
+| Variable                           |                      | What it is                                                                                                                                                                                                                       |
+| ---------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MCP_AUTH_TOKEN`                   | **secret, required** | Every MCP request must send `Authorization: Bearer <token>`. PCP makes it at launch (`generated`) and sends it for you (`registers.auth`). At least 16 characters. Without it the service does not start, unless `MCP_AUTH=off`. |
+| `MCP_AUTH`                         | plain, optional      | `off` serves the tools with no token, to anything that reaches the port; only for a test on a machine of your own.                                                                                                               |
+| `MCP_ALLOWED_HOSTS`                | plain, optional      | `Host` values accepted besides loopback, comma separated (`192.0.2.10:8080`, `host:*`, `*`): the address you publish on, if it is not 127.0.0.1.                                                                                 |
+| `CLAUDE_CONFIG_DIR`                |                      | The CLI's config folder, holding the login: `/home/claude/.claude`, a named volume.                                                                                                                                              |
+| `CLAUDE_BIN`                       |                      | The CLI: `/usr/local/bin/claude`.                                                                                                                                                                                                |
+| `MCP_PORT`, `MCP_HOST`, `MCP_PATH` |                      | Where it listens: `8080`, `0.0.0.0` (inside the container), `/mcp`.                                                                                                                                                              |
 
 There is no variable for the login: you sign in through the tools above.
 
@@ -394,10 +349,13 @@ and the answers). The MCP side logs nothing per request.
 PCP runs it as a service on one of your SSH servers, with the Docker or
 Podman there, and adds it as an MCP server. The definition, in the
 [pcp-gg-common](https://github.com/kaperkunde/pcp-gg-common) format
-(`pcp_format` 4, since PCP sends `MCP_AUTH_TOKEN` as a header), is
-[docs/pcp-service.yaml](docs/pcp-service.yaml): port 8080, the volume
-`claude` at `/home/claude/.claude`, the health check at `/health`, and the
-MCP server at `/mcp` with `MCP_AUTH_TOKEN` as its bearer token.
+(`pcp_format` 6, since PCP makes `MCP_AUTH_TOKEN` itself and runs the
+sign-in), is [docs/pcp-service.yaml](docs/pcp-service.yaml): port 8080, the
+volume `claude` at `/home/claude/.claude`, the health check at `/health`,
+the MCP server at `/mcp` with `MCP_AUTH_TOKEN` as its bearer token, which
+PCP makes when it launches the service (`generated`: you choose no secret
+for it), and the sign-in (`signin`: `login_status`, `login_start`,
+`login_finish`), which PCP's own sign-in page runs.
 
 The levels to propose with it (`tool_access` on `register_server`):
 
@@ -429,12 +387,15 @@ The levels to propose with it (`tool_access` on `register_server`):
     "access": "ask",
     "tier": "write"
   },
-  { "tools": ["login_start"], "access": "allowed", "tier": "write" },
-  { "tools": ["login_finish"], "access": "blocked", "tier": "write" }
+  {
+    "tools": ["login_start", "login_finish"],
+    "access": "blocked",
+    "tier": "write"
+  }
 ]
 ```
 
-Then the wrapper above, then the sign-in.
+Then the sign-in, above.
 
 ## Running it yourself
 
@@ -445,8 +406,8 @@ docker run -d --name claude-sessions -p 127.0.0.1:8080:8080 \
   ghcr.io/kaperkunde/claude-sessions-mcp@sha256:<digest>
 ```
 
-Without PCP there is no secret binding: you would call `login_finish` with
-the code yourself, from your own MCP client.
+Without PCP there is no sign-in page: you call `login_start`, then
+`login_finish` with the code yourself, from your own MCP client.
 
 `GET /health` answers `{"status":"ok"}`; every other path but `/mcp`
 answers 404.

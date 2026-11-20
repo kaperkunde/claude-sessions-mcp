@@ -229,7 +229,7 @@ export class Credentials {
     const tokens = this.tokens(await readSettled(this.credentialsFile))
     if (!tokens) {
       throw new SignedOut(
-        "The service is not signed in to claude.ai. Sign in with login_start (see its description).",
+        "The service is not signed in to claude.ai. With PCP, the owner signs in on PCP's sign-in page (PCP's connect_account hands the link); otherwise sign in with login_start and login_finish.",
       )
     }
     const organizationUuid = this.account().organizationUuid
