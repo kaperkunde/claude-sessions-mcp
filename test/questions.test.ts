@@ -107,6 +107,52 @@ describe("the state", () => {
     ).toBe("waiting")
   })
 
+  it("is needs_answer on a real record, whatever else it says", async () => {
+    const s = asking()
+    const record = s.fake.sessions.get(ID)!.record
+    record.connection_status = "disconnected"
+    s.fake.addEvent(ID, {
+      type: "assistant",
+      message: { content: [{ type: "text", text: "Asking you." }] },
+    })
+    const status = await s.ok("session_status", { session_id: ID })
+    expect(status.state).toBe("needs_answer")
+    expect(status.pending_question).not.toBeNull()
+    expect(status.pending_permission).toBeNull()
+  })
+
+  it("is needs_permission, never needs_answer, for a question it cannot read", async () => {
+    const s = asking()
+    const pending = (
+      s.fake.sessions.get(ID)!.record.external_metadata as {
+        pending_action: Record<string, unknown>
+      }
+    ).pending_action
+    pending.request_id = "not an id!"
+    const status = await s.ok("session_status", { session_id: ID })
+    expect(status.state).toBe("needs_permission")
+    expect(status.pending_question).toBeNull()
+    expect(status.pending_permission).toBeNull()
+    expect(
+      stateOf([], {
+        worker_status: "requires_action",
+        external_metadata: {
+          pending_action: { tool_name: "AskUserQuestion" },
+        },
+      }),
+    ).toBe("needs_permission")
+  })
+
+  it("is done when archived, even while stalled", () => {
+    expect(
+      stateOf([{ payload: { type: "assistant" } }], {
+        status: "archived",
+        worker_status: "running",
+        connection_status: "disconnected",
+      }),
+    ).toBe("done")
+  })
+
   it("shows a stalled session and its connection_status", async () => {
     const s = setup()
     s.fake.addSession(ID, {
@@ -151,20 +197,26 @@ describe("pending_question", () => {
         {
           question: COLOUR.question,
           header: "Colour",
+          kind: "choice",
           multi_select: false,
           options: [
-            { label: "Red", description: "Loud" },
-            { label: "Blue, dark", description: "Calm" },
+            { label: "Red", description: "Loud", preview: null },
+            { label: "Blue, dark", description: "Calm", preview: null },
           ],
         },
         {
           question: TARGETS.question,
           header: "Targets",
+          kind: "choice",
           multi_select: true,
           options: [
-            { label: "Staging", description: "First" },
-            { label: "Blue, dark", description: "The dark pool" },
-            { label: 'Say "hi"', description: "Quoted" },
+            { label: "Staging", description: "First", preview: null },
+            {
+              label: "Blue, dark",
+              description: "The dark pool",
+              preview: null,
+            },
+            { label: 'Say "hi"', description: "Quoted", preview: null },
           ],
         },
       ],
@@ -180,7 +232,7 @@ describe("pending_question", () => {
   })
 
   it("reads the questions from the prompt's event when the record has none", async () => {
-    const s = asking()
+    const s = asking([COLOUR], setup(), { metadata: { source: "event" } })
     const metadata = s.fake.sessions.get(ID)!.record.external_metadata as {
       pending_action: Record<string, unknown>
     }
@@ -193,7 +245,78 @@ describe("pending_question", () => {
       request_id: "req_q_1",
       answers: [{ question: COLOUR.question, choices: ["Red"] }],
     })
+    const sent = lastPosted(s).payload.response as {
+      response: { updatedInput: unknown }
+    }
+    expect(sent.response.updatedInput).toEqual({
+      questions: [COLOUR],
+      metadata: { source: "event" },
+      answers: { [COLOUR.question]: "Red" },
+    })
   })
+
+  it("shows each question's kind and each option's preview", async () => {
+    const s = asking([
+      {
+        question: "Which layout?",
+        header: "Layout",
+        kind: "choice",
+        options: [
+          { label: "Grid", description: "Rows", preview: "[ ][ ]\n[ ][ ]" },
+          { label: "List", description: "One column" },
+        ],
+      },
+      { question: "What should it be called?", header: "Name", kind: "text" },
+      {
+        question: "How many slides?",
+        header: "Slides",
+        kind: "number",
+        min: 1,
+        max: 20,
+        options: [],
+      },
+    ])
+    const pending = (await s.ok("session_status", { session_id: ID }))
+      .pending_question as { questions: unknown[] }
+    expect(pending.questions).toEqual([
+      {
+        question: "Which layout?",
+        header: "Layout",
+        kind: "choice",
+        multi_select: false,
+        options: [
+          { label: "Grid", description: "Rows", preview: "[ ][ ]\n[ ][ ]" },
+          { label: "List", description: "One column", preview: null },
+        ],
+      },
+      {
+        question: "What should it be called?",
+        header: "Name",
+        kind: "text",
+        multi_select: false,
+        options: [],
+      },
+      {
+        question: "How many slides?",
+        header: "Slides",
+        kind: "number",
+        multi_select: false,
+        options: [],
+      },
+    ])
+  })
+
+  for (const [name, question] of [
+    ["a kind it does not know", { ...COLOUR, kind: "date" }],
+    ["a text question with options", { ...COLOUR, kind: "text" }],
+  ] as const) {
+    it(`withholds ${name} as unreadable`, async () => {
+      const s = asking([question])
+      const pending = (await s.ok("session_status", { session_id: ID }))
+        .pending_question as { input_withheld: string | null }
+      expect(pending.input_withheld).toMatch(/could not be read/)
+    })
+  }
 
   for (const [name, questions, reason] of [
     [
@@ -229,6 +352,55 @@ describe("pending_question", () => {
         },
       ],
       /bidi or zero-width/,
+    ],
+    [
+      "a too long preview's",
+      [
+        {
+          ...COLOUR,
+          options: [
+            { label: "Red", preview: "x".repeat(5000) },
+            { label: "Blue" },
+          ],
+        },
+      ],
+      /too long to show whole/,
+    ],
+    [
+      "a secret-looking preview's",
+      [
+        {
+          ...COLOUR,
+          options: [
+            {
+              label: "Red",
+              preview: "token = sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123",
+            },
+            { label: "Blue" },
+          ],
+        },
+      ],
+      /secret/,
+    ],
+    [
+      "a zero-width preview's",
+      [
+        {
+          ...COLOUR,
+          options: [{ label: "Red", preview: "Re​d" }, { label: "Blue" }],
+        },
+      ],
+      /bidi or zero-width/,
+    ],
+    [
+      "a control character preview's",
+      [
+        {
+          ...COLOUR,
+          options: [{ label: "Red", preview: "Red\u0007" }, { label: "Blue" }],
+        },
+      ],
+      /control characters/,
     ],
   ] as const) {
     it(`withholds ${name} questions, which cannot be answered from here`, async () => {
@@ -292,6 +464,7 @@ describe("answer_question", () => {
           metadata: { source: "x" },
           answers: { [COLOUR.question]: "Blue, dark" },
         },
+        toolUseID: "toolu_req_q_1",
       },
     })
     expect(s.fake.sessions.get(ID)!.record.worker_status).toBe("running")
@@ -342,6 +515,99 @@ describe("answer_question", () => {
     })
   })
 
+  it("takes text beside choices on a multi_select question, joined as the CLI joins them", async () => {
+    const s = asking([TARGETS])
+    await s.ok("answer_question", {
+      session_id: ID,
+      request_id: "req_q_1",
+      answers: [
+        {
+          question: TARGETS.question,
+          choices: ["Staging", "Blue, dark"],
+          text: "Prod, eu",
+        },
+      ],
+    })
+    const sent = lastPosted(s).payload.response as {
+      response: { updatedInput: { answers: Record<string, string> } }
+    }
+    expect(sent.response.updatedInput.answers).toEqual({
+      [TARGETS.question]: 'Staging, "Blue, dark", "Prod, eu"',
+    })
+  })
+
+  it("answers a text or number question with text only", async () => {
+    const NAME = { question: "What should it be called?", kind: "text" }
+    const COUNT = {
+      question: "How many slides?",
+      kind: "number",
+      min: 1,
+      max: 20,
+    }
+    const s = asking([NAME, COUNT])
+    expect(
+      errorText(
+        await answer(s, [
+          { question: NAME.question, choices: ["Deck"] },
+          { question: COUNT.question, text: "12" },
+        ]),
+      ),
+    ).toMatch(/text only/)
+    expect(s.fake.posted).toHaveLength(0)
+    await s.ok("answer_question", {
+      session_id: ID,
+      request_id: "req_q_1",
+      answers: [
+        { question: NAME.question, text: "Quarterly, final" },
+        { question: COUNT.question, text: "12" },
+      ],
+    })
+    const sent = lastPosted(s).payload.response as {
+      response: { updatedInput: { answers: Record<string, string> } }
+    }
+    expect(sent.response.updatedInput.answers).toEqual({
+      [NAME.question]: "Quarterly, final",
+      [COUNT.question]: "12",
+    })
+  })
+
+  it("leaves toolUseID out when the prompt carries no tool_use_id", async () => {
+    const s = asking()
+    const pending = (
+      s.fake.sessions.get(ID)!.record.external_metadata as {
+        pending_action: Record<string, unknown>
+      }
+    ).pending_action
+    delete pending.tool_use_id
+    await s.ok("answer_question", {
+      session_id: ID,
+      request_id: "req_q_1",
+      answers: [{ question: COLOUR.question, choices: ["Red"] }],
+    })
+    const sent = lastPosted(s).payload.response as {
+      response: Record<string, unknown>
+    }
+    expect(sent.response).not.toHaveProperty("toolUseID")
+  })
+
+  it("answers once when two calls come at once", async () => {
+    const s = asking()
+    s.fake.lagging = true
+    const args = {
+      session_id: ID,
+      request_id: "req_q_1",
+      answers: [{ question: COLOUR.question, choices: ["Red"] }],
+    }
+    const results = await Promise.all([
+      s.call("answer_question", args),
+      s.call("answer_question", args),
+    ])
+    expect(results.filter((r) => !r.isError)).toHaveLength(1)
+    const refused = results.find((r) => r.isError)
+    expect(refused && errorText(refused)).toMatch(/already answered/)
+    expect(s.fake.posted).toHaveLength(1)
+  })
+
   it("declines with the owner's message", async () => {
     const s = asking()
     expect(
@@ -362,7 +628,11 @@ describe("answer_question", () => {
     expect(lastPosted(s).payload.response).toEqual({
       subtype: "success",
       request_id: "req_q_1",
-      response: { behavior: "deny", message: "Ask me later." },
+      response: {
+        behavior: "deny",
+        message: "Ask me later.",
+        toolUseID: "toolu_req_q_1",
+      },
     })
   })
 

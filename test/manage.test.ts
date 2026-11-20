@@ -238,6 +238,35 @@ describe("answer_permission", () => {
     ).toMatch(/already answered/)
     expect(s.fake.posted).toHaveLength(1)
   })
+
+  it("answers once when two calls come at once", async () => {
+    const s = waiting()
+    s.fake.lagging = true
+    // A refused allow gives the prompt back: it can still be answered.
+    expect(
+      errorText(
+        await s.call("answer_permission", {
+          session_id: ID,
+          request_id: "req_perm_1",
+          decision: "allow",
+        }),
+      ),
+    ).toMatch(/expected_input/)
+    const args = {
+      session_id: ID,
+      request_id: "req_perm_1",
+      decision: "allow",
+      expected_input: '{"command":"pnpm test"}',
+    }
+    const results = await Promise.all([
+      s.call("answer_permission", args),
+      s.call("answer_permission", args),
+    ])
+    expect(results.filter((r) => !r.isError)).toHaveLength(1)
+    const refused = results.find((r) => r.isError)
+    expect(refused && errorText(refused)).toMatch(/already answered/)
+    expect(s.fake.posted).toHaveLength(1)
+  })
 })
 
 describe("send_message's priority", () => {
