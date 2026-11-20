@@ -222,8 +222,10 @@ export class FakeAnthropic {
     const id = parts[3]!
     const session = this.sessions.get(id)
     if (!session) return error(404, "session not found")
+    // The real API wraps one session's record (seen live, 2026-11-20):
+    // { response_shape: { id, title, status, … } }; the list gives them bare.
     if (parts.length === 4 && request.method === "GET")
-      return json(200, session.record)
+      return json(200, { response_shape: session.record })
     if (parts.length === 4 && request.method === "PUT") {
       const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>
       if (

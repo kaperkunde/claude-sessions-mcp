@@ -176,9 +176,7 @@ export class SessionsApi {
 
   async getSession(id: string): Promise<Record<string, unknown>> {
     const { data } = await this.call("GET", `/v1/code/sessions/${id}`)
-    return data && typeof data === "object"
-      ? (data as Record<string, unknown>)
-      : {}
+    return sessionRecord(data)
   }
 
   /**
@@ -277,4 +275,19 @@ function objects(value: unknown): Record<string, unknown>[] {
           !!item && typeof item === "object" && !Array.isArray(item),
       )
     : []
+}
+
+/**
+ * One session's record out of the answer to `GET /v1/code/sessions/{id}`.
+ * The API wraps it (`{ response_shape: { id, title, … } }`), while the
+ * list gives records bare; a bare record is taken as it is.
+ */
+export function sessionRecord(data: unknown): Record<string, unknown> {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return {}
+  const record = data as Record<string, unknown>
+  if (typeof record.id === "string") return record
+  const inner = record.response_shape
+  return inner && typeof inner === "object" && !Array.isArray(inner)
+    ? (inner as Record<string, unknown>)
+    : {}
 }
