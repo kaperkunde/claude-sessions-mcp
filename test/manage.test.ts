@@ -38,6 +38,7 @@ describe("get_session", () => {
         post_turn_summary: { status_detail: "Fixing gate tests" },
       },
       worker_status: "running",
+      connection_status: "connected",
     })
     const { session } = await s.ok("get_session", { session_id: ID })
     expect(session).toEqual({
@@ -47,6 +48,7 @@ describe("get_session", () => {
       updated_at: "2026-11-18T17:00:00Z",
       repo: "kaperkunde/pcp",
       worker_status: "running",
+      connection_status: "connected",
       environment_id: "env_01DefaultCloud",
       environment_kind: "anthropic_cloud",
       created_at: "2026-11-18T16:00:00Z",
@@ -55,6 +57,7 @@ describe("get_session", () => {
       summary: "Fixing gate tests",
       url: `https://claude.ai/code/${ID}`,
       pending_permission: null,
+      pending_question: null,
     })
   })
 })

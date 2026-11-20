@@ -28,7 +28,20 @@ export type Item = {
 }
 
 export type State =
-  "working" | "waiting" | "needs_permission" | "done" | "unknown"
+  | "working"
+  | "waiting"
+  | "needs_permission"
+  | "needs_answer"
+  | "stalled"
+  | "done"
+  | "unknown"
+
+/**
+ * The tool a session asks its person questions with. Its prompt comes as
+ * a permission prompt for this tool, and is answered with the answers in
+ * its input (answer_question), never allowed as it is.
+ */
+export const QUESTION_TOOL = "AskUserQuestion"
 
 type Obj = Record<string, unknown>
 
@@ -151,10 +164,13 @@ const ACTIVITY = new Set(["assistant", "user"])
 
 /**
  * What the session is doing, from its newest events (newest first) and
- * its own record: done when archived; needs_permission when it waits on a
- * permission prompt; waiting when its newest turn ended (a result or a
- * prompt suggestion is newer than any message); working when a message is
- * newer than the last turn's end.
+ * its own record: done when archived; needs_answer when it waits on a
+ * question (QUESTION_TOOL), needs_permission when it waits on any other
+ * permission prompt; stalled when its worker runs but lost contact (the
+ * CLI's own "lost contact with the cloud environment": worker running,
+ * connection disconnected); waiting when its newest turn ended (a result
+ * or a prompt suggestion is newer than any message); working when a
+ * message is newer than the last turn's end.
  */
 export function stateOf(
   newestFirst: ApiEvent[],
@@ -162,7 +178,17 @@ export function stateOf(
 ): State {
   const status = session.status ?? session.session_status
   if (status === "archived") return "done"
-  if (session.worker_status === "requires_action") return "needs_permission"
+  if (session.worker_status === "requires_action") {
+    const pending = obj(obj(session.external_metadata)?.pending_action)
+    return pending?.tool_name === QUESTION_TOOL
+      ? "needs_answer"
+      : "needs_permission"
+  }
+  if (
+    session.worker_status === "running" &&
+    session.connection_status === "disconnected"
+  )
+    return "stalled"
   for (const event of newestFirst) {
     const type = typeOf(event)
     if (type === undefined) continue
@@ -334,18 +360,228 @@ export function permissionView(
     input_withheld: reason,
   })
   if (!input) return withheld("The prompt's input could not be read.")
+  const reason = withheldReason(input)
+  if (reason) return withheld(reason)
+  return { ...base, input: JSON.stringify(input), input_withheld: null }
+}
+
+/**
+ * Why an input is not shown whole, or undefined when it is: longer than
+ * MAX_SHOWN_INPUT_CHARS as JSON text, something that looks like a secret,
+ * or characters that do not show as they are.
+ */
+function withheldReason(input: Record<string, unknown>): string | undefined {
   const text = JSON.stringify(input)
   if (text.length > MAX_SHOWN_INPUT_CHARS)
-    return withheld(
-      `The input is too long to show whole (${text.length} characters; at most ${MAX_SHOWN_INPUT_CHARS}).`,
-    )
+    return `The input is too long to show whole (${text.length} characters; at most ${MAX_SHOWN_INPUT_CHARS}).`
   if (holdsSecret(text))
-    return withheld(
-      "The input looks like it holds a secret, so it is not shown.",
-    )
+    return "The input looks like it holds a secret, so it is not shown."
   if (FORMAT.test(text))
-    return withheld(
-      "The input has characters that do not show as they are (bidi or zero-width).",
+    return "The input has characters that do not show as they are (bidi or zero-width)."
+  return undefined
+}
+
+/** Whether a prompt is a question (QUESTION_TOOL), not a permission. */
+export function isQuestion(action: PendingAction): boolean {
+  return action.toolName === QUESTION_TOOL
+}
+
+export type QuestionView = {
+  request_id: string
+  /** Every question, as asked; empty when withheld. */
+  questions: {
+    question: string
+    header: string | null
+    multi_select: boolean
+    options: { label: string; description: string | null }[]
+  }[]
+  /** Why the questions are not shown (and cannot be answered here). */
+  input_withheld: string | null
+}
+
+type Question = QuestionView["questions"][number]
+
+/** The most questions one prompt asks, as the CLI's tool takes them. */
+export const MAX_QUESTIONS = 4
+/** The most an answer may hold in all, as the CLI's check takes it. */
+export const MAX_ANSWER_TOTAL_CHARS = 32768
+
+/** Control characters but a line break: text that shows otherwise. */
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/
+
+/** A question's own text, exactly as asked; undefined if it is not one. */
+function exact(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined
+}
+
+/**
+ * The questions in a question prompt's input ({questions: [{question,
+ * header, options: [{label, description}], multiSelect}]}), exactly as
+ * asked, or why they cannot be shown.
+ */
+function readQuestions(
+  input: Record<string, unknown>,
+): { questions: Question[] } | { reason: string } {
+  const unreadable = { reason: "The questions could not be read." }
+  const raw = input.questions
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_QUESTIONS)
+    return unreadable
+  const questions: Question[] = []
+  for (const item of raw) {
+    const q = obj(item)
+    const question = exact(q?.question)
+    if (!q || !question) return unreadable
+    if (q.header !== undefined && typeof q.header !== "string")
+      return unreadable
+    if (q.multiSelect !== undefined && typeof q.multiSelect !== "boolean")
+      return unreadable
+    if (!Array.isArray(q.options)) return unreadable
+    const options: Question["options"] = []
+    for (const o of q.options.map(obj)) {
+      const label = exact(o?.label)
+      if (!o || !label) return unreadable
+      if (o.description !== undefined && typeof o.description !== "string")
+        return unreadable
+      options.push({
+        label,
+        description: (o.description as string | undefined) ?? null,
+      })
+    }
+    if (new Set(options.map((o) => o.label)).size !== options.length)
+      return { reason: "Two options of a question have the same label." }
+    questions.push({
+      question,
+      header: (q.header as string | undefined) ?? null,
+      multi_select: q.multiSelect === true,
+      options,
+    })
+  }
+  if (new Set(questions.map((q) => q.question)).size !== questions.length)
+    return { reason: "Two of its questions have the same text." }
+  const shownText = questions.flatMap((q) => [
+    q.question,
+    q.header ?? "",
+    ...q.options.flatMap((o) => [o.label, o.description ?? ""]),
+  ])
+  if (shownText.some((text) => CONTROL.test(text)))
+    return {
+      reason:
+        "The questions have characters that do not show as they are (control characters).",
+    }
+  return { questions }
+}
+
+/**
+ * A question prompt as shown: its questions exactly as asked, whole or
+ * not at all, withheld as a permission prompt's input is (and then never
+ * answered from here).
+ */
+export function questionView(
+  action: PendingAction,
+  input: Record<string, unknown> | undefined,
+): QuestionView {
+  const withheld = (reason: string): QuestionView => ({
+    request_id: action.requestId,
+    questions: [],
+    input_withheld: reason,
+  })
+  if (!input) return withheld("The prompt's input could not be read.")
+  const reason = withheldReason(input)
+  if (reason) return withheld(reason)
+  const read = readQuestions(input)
+  if ("reason" in read) return withheld(read.reason)
+  return {
+    request_id: action.requestId,
+    questions: read.questions,
+    input_withheld: null,
+  }
+}
+
+/** One answer as answer_question takes it. */
+export type QuestionAnswer = {
+  question: string
+  choices?: string[]
+  text?: string
+}
+
+/**
+ * Several choices as one answer, as the CLI joins them: ", " between,
+ * and a choice that holds ", " or a double quote as a JSON string.
+ */
+export function joinChoices(choices: string[]): string {
+  return choices
+    .map((c) => (c.includes(", ") || c.includes('"') ? JSON.stringify(c) : c))
+    .join(", ")
+}
+
+/**
+ * The answers to send ({question text: answer}) for the questions shown,
+ * or why they cannot be sent: every question answered once, by its exact
+ * text; choices among its labels, one unless it is multi_select; or a
+ * free text (the "Other" answer) alone; within the CLI's length.
+ */
+export function questionAnswers(
+  questions: Question[],
+  answers: QuestionAnswer[],
+):
+  { ok: true; answers: Record<string, string> } | { ok: false; error: string } {
+  const fail = (error: string) => ({ ok: false as const, error })
+  const quote = (text: string) => `"${clean(text, 200)}"`
+  const out: Record<string, string> = {}
+  for (const given of answers) {
+    const question = questions.find((q) => q.question === given.question)
+    if (!question)
+      return fail(
+        `${quote(given.question)} is not one of its questions: give each question's text exactly as pending_question shows it.`,
+      )
+    if (Object.hasOwn(out, question.question))
+      return fail(
+        `${quote(question.question)} is answered more than once: answer each question once.`,
+      )
+    const choices = given.choices ?? []
+    const text = given.text
+    if (text !== undefined && choices.length > 0)
+      return fail(
+        `text is the free answer and goes alone: answer ${quote(question.question)} with choices or text, not both.`,
+      )
+    if (text !== undefined) {
+      if (!text.trim())
+        return fail(`Answer ${quote(question.question)} with choices or text.`)
+      if (CONTROL.test(text) || FORMAT.test(text))
+        return fail(
+          `The answer to ${quote(question.question)} has characters that do not show as they are (control, bidi or zero-width).`,
+        )
+      out[question.question] = text
+      continue
+    }
+    if (choices.length === 0)
+      return fail(`Answer ${quote(question.question)} with choices or text.`)
+    const labels = question.options.map((o) => o.label)
+    const unknown = choices.find((c) => !labels.includes(c))
+    if (unknown !== undefined)
+      return fail(
+        `${quote(unknown)} is not one of the labels of ${quote(question.question)}: choose labels exactly as shown, or answer with text.`,
+      )
+    if (new Set(choices).size !== choices.length)
+      return fail(`A choice is given twice for ${quote(question.question)}.`)
+    if (!question.multi_select && choices.length > 1)
+      return fail(
+        `${quote(question.question)} takes one choice (it is not multi_select).`,
+      )
+    out[question.question] = question.multi_select
+      ? joinChoices(choices)
+      : choices[0]!
+  }
+  const missing = questions.find((q) => !Object.hasOwn(out, q.question))
+  if (missing)
+    return fail(
+      `Answer every question it asks, each once: ${quote(missing.question)} has no answer.`,
     )
-  return { ...base, input: text, input_withheld: null }
+  const total = Object.values(out).reduce((sum, a) => sum + a.length, 0)
+  if (total > MAX_ANSWER_TOTAL_CHARS)
+    return fail(
+      `The answers are longer than the session takes (${total} characters; at most ${MAX_ANSWER_TOTAL_CHARS} in all).`,
+    )
+  return { ok: true, answers: out }
 }
