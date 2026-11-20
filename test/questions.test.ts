@@ -255,6 +255,27 @@ describe("pending_question", () => {
     })
   })
 
+  it("shows a preview indented with tabs or with CRLF line ends", async () => {
+    const preview = "func main() {\r\n\tfmt.Println(1)\r\n}"
+    const s = asking([
+      {
+        question: "Which version?",
+        header: "Version",
+        options: [
+          { label: "Go", description: "Tabs", preview },
+          { label: "Make", description: "Rules", preview: "all:\n\tgo build" },
+        ],
+      },
+    ])
+    const pending = (await s.ok("session_status", { session_id: ID }))
+      .pending_question as {
+      input_withheld: string | null
+      questions: { options: { preview: string | null }[] }[]
+    }
+    expect(pending.input_withheld).toBeNull()
+    expect(pending.questions[0]?.options[0]?.preview).toBe(preview)
+  })
+
   it("shows each question's kind and each option's preview", async () => {
     const s = asking([
       {
