@@ -387,6 +387,23 @@ export class FakeAnthropic {
       },
     })
   }
+
+  /**
+   * Puts a question on a session, as a worker waiting on AskUserQuestion:
+   * the same record and control_request as a permission prompt, with the
+   * question tool's name and its input ({questions: […]}).
+   */
+  askQuestion(
+    id: string,
+    prompt: { requestId: string; input: Record<string, unknown> },
+  ) {
+    this.askPermission(id, {
+      requestId: prompt.requestId,
+      toolName: "AskUserQuestion",
+      description: "Asks the user a question",
+      input: prompt.input,
+    })
+  }
 }
 
 /** Writes a login into a CLI config folder, as the CLI keeps it. */

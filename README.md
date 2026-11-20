@@ -5,7 +5,7 @@ made to run as a [PCP](https://pcp.gg) service. Any assistant connected to
 PCP, a voice chat with no Claude Code tools included, can list your
 sessions, see what one is doing, ask it a quick side question without
 derailing it, send it a message, interrupt it, answer its permission
-prompt, archive, unarchive or rename it, or start a new one in the cloud
+prompt or the questions it asks you, archive, unarchive or rename it, or start a new one in the cloud
 environment of your choice. It all
 runs on your own claude.ai plan (Pro or Max), not API credits.
 
@@ -26,23 +26,24 @@ pinned in the image and why there is a smoke test to run after updating it
 
 ## Tools
 
-| Tool                | Tier  | Suggested level | What it does                                                                                                                                                                                                                                                            |
-| ------------------- | ----- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_sessions`     | Read  | allowed         | Your sessions, newest first: id (`cse_…`), title, status, last change, repository. Archived ones only with `include_archived`.                                                                                                                                          |
-| `get_session`       | Read  | allowed         | One session's details: title, status, what its worker is doing, repository and branch, model, environment, created and last changed, its latest summary, its address, and the permission prompt it waits on. The API names no pull requests, so none are given.         |
-| `session_status`    | Read  | allowed         | What one session is doing: `state` (working, waiting, needs_permission, done), the permission prompt it waits on, and its newest `events` (default 30) summarised; `cursor` (the answer's `next_cursor`) reads older ones. Never thinking, tool inputs or tool results. |
-| `ask_session`       | Read  | allowed         | A side question, as `/btw` in the terminal: the session answers from its whole context, without tools, and nothing is added to its conversation. Waits up to `timeout_seconds` (default 45, at most 120).                                                               |
-| `list_environments` | Read  | allowed         | The cloud environments your account can start sessions in, as `/remote-env` lists them: id, name, kind.                                                                                                                                                                 |
-| `login_status`      | Read  | allowed         | Whether the service is signed in and as whom (email, organization, plan), when the access token lapses, whether a sign-in waits for its code. Never a token.                                                                                                            |
-| `send_message`      | Write | **ask**         | A message into the session's conversation, as if you typed it; a busy session takes it at its next step, or as `priority` says (`now`, `next`, `later`). `interrupt_first` stops the current turn first.                                                                |
-| `interrupt_session` | Write | **ask**         | Stops the current turn (as Esc does) and drops queued messages; background tasks keep running.                                                                                                                                                                          |
-| `answer_permission` | Write | **ask**         | Allows once (with `expected_input`, the shown input echoed back exactly), or denies with a message, the permission prompt a session waits on: only the one `request_id` names, only while it still waits on it, and only once.                                          |
-| `start_session`     | Write | **ask**         | A new cloud session on a GitHub `repo` (owner/name) with `task` as its first message, through `claude --cloud`, in your default cloud environment or the one `environment_id` names. `branch` is the repository's default branch (`main` if left out).                  |
-| `archive_session`   | Write | **ask**         | Archives a session, as on claude.ai/code: it stops and leaves the list. Nothing is deleted.                                                                                                                                                                             |
-| `unarchive_session` | Write | **ask**         | Brings an archived session back. claude.ai may ask for a trusted device for this; it then says to do it on claude.ai/code.                                                                                                                                              |
-| `rename_session`    | Write | **ask**         | Sets a session's title (one line, up to 200 characters).                                                                                                                                                                                                                |
-| `login_start`       | Write | allowed         | Starts the claude.ai sign-in and answers the address you sign in at. Changes nothing until it is finished.                                                                                                                                                              |
-| `login_finish`      | Write | **blocked**     | Finishes the sign-in with your code. Only through the wrapper below, which hands it the code as a PCP secret.                                                                                                                                                           |
+| Tool                | Tier  | Suggested level | What it does                                                                                                                                                                                                                                                                                            |
+| ------------------- | ----- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_sessions`     | Read  | allowed         | Your sessions, newest first: id (`cse_…`), title, status, last change, repository. Archived ones only with `include_archived`.                                                                                                                                                                          |
+| `get_session`       | Read  | allowed         | One session's details: title, status, what its worker is doing, repository and branch, model, environment, created and last changed, its connection status, its latest summary, its address, and the permission prompt or questions it waits on. The API names no pull requests, so none are given.     |
+| `session_status`    | Read  | allowed         | What one session is doing: `state` (below), the permission prompt or questions it waits on, and its newest `events` (default 30) summarised; `cursor` (the answer's `next_cursor`) reads older ones. Never thinking, tool inputs or tool results.                                                       |
+| `ask_session`       | Read  | allowed         | A side question, as `/btw` in the terminal: the session answers from its whole context, without tools, and nothing is added to its conversation. Waits up to `timeout_seconds` (default 45, at most 120).                                                                                               |
+| `list_environments` | Read  | allowed         | The cloud environments your account can start sessions in, as `/remote-env` lists them: id, name, kind.                                                                                                                                                                                                 |
+| `login_status`      | Read  | allowed         | Whether the service is signed in and as whom (email, organization, plan), when the access token lapses, whether a sign-in waits for its code. Never a token.                                                                                                                                            |
+| `send_message`      | Write | **ask**         | A message into the session's conversation, as if you typed it; a busy session takes it at its next step, or as `priority` says (`now`, `next`, `later`). `interrupt_first` stops the current turn first.                                                                                                |
+| `interrupt_session` | Write | **ask**         | Stops the current turn (as Esc does) and drops queued messages; background tasks keep running.                                                                                                                                                                                                          |
+| `answer_permission` | Write | **ask**         | Allows once (with `expected_input`, the shown input echoed back exactly), or denies with a message, the permission prompt a session waits on: only the one `request_id` names, only while it still waits on it, and only once.                                                                          |
+| `answer_question`   | Write | **ask**         | Answers the questions a session asks you (`AskUserQuestion`), or declines them with a message: every question once, by its exact text, with `choices` among its labels (one unless `multi_select`) or your own `text`; only the one `request_id` names, only while it still waits on it, and only once. |
+| `start_session`     | Write | **ask**         | A new cloud session on a GitHub `repo` (owner/name) with `task` as its first message, through `claude --cloud`, in your default cloud environment or the one `environment_id` names. `branch` is the repository's default branch (`main` if left out).                                                  |
+| `archive_session`   | Write | **ask**         | Archives a session, as on claude.ai/code: it stops and leaves the list. Nothing is deleted.                                                                                                                                                                                                             |
+| `unarchive_session` | Write | **ask**         | Brings an archived session back. claude.ai may ask for a trusted device for this; it then says to do it on claude.ai/code.                                                                                                                                                                              |
+| `rename_session`    | Write | **ask**         | Sets a session's title (one line, up to 200 characters).                                                                                                                                                                                                                                                |
+| `login_start`       | Write | allowed         | Starts the claude.ai sign-in and answers the address you sign in at. Changes nothing until it is finished.                                                                                                                                                                                              |
+| `login_finish`      | Write | **blocked**     | Finishes the sign-in with your code. Only through the wrapper below, which hands it the code as a PCP secret.                                                                                                                                                                                           |
 
 Read tools state `readOnlyHint: true`, the others `false`; none is
 destructive. Every tool states all four annotations, takes a closed
@@ -50,8 +51,8 @@ snake_case input whose every property is described, and answers JSON as
 `structuredContent` with an output schema.
 
 In PCP, a Write tool at **ask** means PCP asks you before each call:
-nothing is sent to a session, interrupted, allowed, started, archived or
-renamed without your yes.
+nothing is sent to a session, interrupted, allowed, answered, started,
+archived or renamed without your yes.
 
 Every request a tool makes is one the pinned CLI (2.1.327) makes itself:
 the paths, bodies and fields were read out of its bundle, not guessed
@@ -82,6 +83,68 @@ what you allow. It reads the session again first and refuses when that
 prompt is no longer the one it waits on, and it answers a prompt once:
 the service remembers the prompts it answered (the newest 1,000) and
 refuses a second answer, even while the record still shows the prompt.
+A prompt is claimed before the session is read, so two answers sent at
+once post once, and given back when the answer is refused or does not go
+in.
+
+### Questions
+
+When a session asks you something (Claude Code's `AskUserQuestion`: one
+to four questions, each with a short heading and options), its worker is
+`requires_action` on a prompt for that tool. `session_status` and
+`get_session` then show it as `pending_question`, never as
+`pending_permission`: the prompt's `request_id` and each question exactly
+as asked, with its `header`, its `kind` (`choice`, the default, among its
+options; `text` or `number`, the owner's own words, no options), whether
+it is `multi_select`, and its options (`label`, `description`,
+`preview`). The questions are withheld (`questions` empty,
+`input_withheld` says why) on the same rules as a permission prompt's
+input, previews included: unreadable (a `kind` it does not know, or a
+text or number question with options, among them), longer than 4,000
+characters, secret-looking, or with characters that do not show as they
+are. Withheld questions can only be declined from here.
+
+`answer_question` answers as the CLI does, with the same
+`control_response`: `{behavior:"allow", updatedInput:{…the input as
+asked, answers}}`, where `answers` maps each question's text to its
+answer: a label, several labels joined as the CLI joins them (`, `
+between, a label holding `, ` or `"` written as a JSON string), or your
+own words (`text`, the "Other" answer: alone, or on a `multi_select`
+question joined after the labels as one more item, as the CLI takes up to
+its options and one). A `text` or `number` question takes `text` only.
+With `decline` it sends `{behavior:"deny", message}`. Both carry
+`toolUseID` when the prompt has a `tool_use_id`, as `answer_permission`'s
+do. Before anything is sent it checks that the
+prompt is still the one the session waits on, that it was not answered
+from here before or is not being answered now (the same memory as
+`answer_permission`, claimed before anything is read, so two calls at
+once post once, and given back when the answer is refused or does not go
+in), that every
+question is answered exactly once by its exact text, that each choice is
+one of that question's labels and only one unless `multi_select`, and that
+the answers stay within the 32,768 characters the CLI takes.
+`answer_permission` refuses a question and `answer_question` a permission
+prompt, each naming the other. An assistant relays only what you chose or
+said; the questions themselves are the session's words, data like the
+rest.
+
+### States
+
+`session_status`'s `state`, from the session's record and its newest
+events:
+
+| State              | When                                                                                                                                                        |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `done`             | It is archived.                                                                                                                                             |
+| `needs_answer`     | Its worker is `requires_action` on a question (`AskUserQuestion`) it can read: answer it with `answer_question`.                                            |
+| `needs_permission` | Its worker is `requires_action` on any other permission prompt, or on one it cannot read (then no `pending_…`: answer it on claude.ai/code).                |
+| `stalled`          | Its worker is `running` but its `connection_status` is `disconnected`: the CLI's "lost contact with the cloud environment". Nothing moves until it is back. |
+| `waiting`          | Its newest turn ended (a result or a prompt suggestion is newer than any message): it waits for a message.                                                  |
+| `working`          | A message is newer than the last turn's end.                                                                                                                |
+| `unknown`          | None of these can be told from what it read.                                                                                                                |
+
+`get_session` gives `worker_status` and `connection_status` as the API
+says them.
 
 **Untrusted text.** What a session wrote, and whatever it read on the way
 (a web page, an issue, a file), comes back in `session_status`,
@@ -229,6 +292,7 @@ x-organization-uuid: <oauthAccount.organizationUuid>
 | `send_message`      | the same POST with `event_type` `user`: `{type:"user", parent_tool_use_id:null, message:{role:"user", content}, priority?}`                                                                                                                                                                                                             |
 | `interrupt_session` | a `control_request` `{subtype:"interrupt", cancel_queued:true, spare_background_tasks:true, send_now:true}`, as the CLI sends it; its `control_response` awaited for 15 seconds                                                                                                                                                         |
 | `answer_permission` | a `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput, toolUseID, tool_name}}` or `{behavior:"deny", message, toolUseID}`, for the prompt in the record's `external_metadata.pending_action`                                                                                                   |
+| `answer_question`   | the same `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput:{…input, answers:{<question>: <answer>}}, toolUseID}}` or `{behavior:"deny", message, toolUseID}`, for a `pending_action` whose `tool_name` is `AskUserQuestion`                                                                  |
 | `archive_session`   | `POST /v1/code/sessions/{id}/archive` with `{}` (409: it already was)                                                                                                                                                                                                                                                                   |
 | `unarchive_session` | `POST /v1/code/sessions/{id}/unarchive` with `{}`                                                                                                                                                                                                                                                                                       |
 | `rename_session`    | `PUT /v1/code/sessions/{id}` with `{"title": …}`                                                                                                                                                                                                                                                                                        |
@@ -356,6 +420,7 @@ The levels to propose with it (`tool_access` on `register_server`):
       "send_message",
       "interrupt_session",
       "answer_permission",
+      "answer_question",
       "start_session",
       "archive_session",
       "unarchive_session",
@@ -422,7 +487,8 @@ process (`test/fake-claude.mjs`), which prints a sign-in address, reads the
 code and writes a login as the CLI does, and answers `--cloud` as the CLI
 does. They cover every tool: the summaries and states, paging, the side
 question in a busy session, messages (with priority) and interrupts,
-permission prompts, archive, unarchive and rename, environments, the 403
+permission prompts and questions, stalled sessions, archive, unarchive
+and rename, environments, the 403
 of a device-bound session,
 renewal (before expiry, on a 401, once for calls at the same time, over
 days), the sign-in, `start_session`, the HTTP side, the logs, the egress

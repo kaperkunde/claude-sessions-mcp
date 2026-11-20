@@ -47,6 +47,30 @@ describe("tokens and codes", () => {
         expected_input: '{"command":"echo hi"}',
       }),
     )
+    s.fake.askQuestion(ID, {
+      requestId: "req_q_1",
+      input: {
+        questions: [
+          {
+            question: "Which one?",
+            header: "Pick",
+            multiSelect: false,
+            options: [
+              { label: "A", description: "a" },
+              { label: "B", description: "b" },
+            ],
+          },
+        ],
+      },
+    })
+    answers.push(await s.call("session_status", { session_id: ID }))
+    answers.push(
+      await s.call("answer_question", {
+        session_id: ID,
+        request_id: "req_q_1",
+        answers: [{ question: "Which one?", choices: ["A"] }],
+      }),
+    )
     answers.push(await s.call("list_environments"))
     answers.push(
       await s.call("rename_session", { session_id: ID, title: "Renamed" }),
@@ -92,6 +116,7 @@ describe("tokens and codes", () => {
     expect(log).not.toContain("status?")
     expect(log).not.toContain("Renamed")
     expect(log).not.toContain("echo hi")
+    expect(log).not.toContain("Which one?")
   })
 
   it("redact masks tokens, bearer headers and sign-in codes", () => {
