@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest"
 import { DEFAULT_CONFIG_DIR, loadConfig } from "../src/config.ts"
 
 /**
- * docs/pcp-service.yaml is the PCP service definition (pcp_format 4, as
+ * docs/pcp-service.yaml is the PCP service definition (pcp_format 6, as
  * kaperkunde/pcp-gg-common holds them), and the Dockerfile builds what it
  * runs. Both are checked here against what the code reads and serves, so
  * they do not drift apart.
@@ -16,6 +16,7 @@ const ROOT = join(import.meta.dirname, "..")
 const yaml = readFileSync(join(ROOT, "docs", "pcp-service.yaml"), "utf8")
 const config = readFileSync(join(ROOT, "src", "config.ts"), "utf8")
 const dockerfile = readFileSync(join(ROOT, "Dockerfile"), "utf8")
+const tools = readFileSync(join(ROOT, "src", "tools.ts"), "utf8")
 const defaults = loadConfig({ MCP_AUTH: "off" })
 
 describe("the PCP service definition", () => {
@@ -50,11 +51,49 @@ describe("the PCP service definition", () => {
     expect(dockerfile).toContain(`CLAUDE_CONFIG_DIR=${DEFAULT_CONFIG_DIR}`)
   })
 
-  it("has PCP send the MCP token the service checks", () => {
-    expect(yaml).toMatch(/^pcp_format: 4$/m)
+  it("has PCP make and send the MCP token the service checks", () => {
+    expect(yaml).toMatch(/^pcp_format: 6$/m)
     expect(yaml).toMatch(
       /auth:\n {4}env: MCP_AUTH_TOKEN\n {4}header: Authorization\n {4}template: Bearer \{\{secret\}\}\n/,
     )
+    // PCP makes its value at launch: no secret for the owner to make up.
+    expect(yaml).toMatch(
+      /- name: MCP_AUTH_TOKEN\n(?: {4}\S.*\n)* {4}generated: true\n/,
+    )
+  })
+
+  it("declares the sign-in PCP's own page runs, with the tools and fields the service has", () => {
+    expect(yaml).toContain(
+      [
+        "signin:",
+        "  style: paste_code",
+        "  status:",
+        "    tool: login_status",
+        "    signed_in: signed_in",
+        "    who: email",
+        "  start:",
+        "    tool: login_start",
+        "    url: url",
+        "    expires: expires_at",
+        "  finish:",
+        "    tool: login_finish",
+        "    argument: code",
+        "",
+      ].join("\n"),
+    )
+    // Each is a tool the service serves, its fields what it answers.
+    for (const name of ["login_status", "login_start", "login_finish"]) {
+      expect(tools, name).toContain(`name: "${name}"`)
+    }
+    for (const field of [
+      "signed_in:",
+      "email:",
+      "url:",
+      "expires_at:",
+      "code:",
+    ]) {
+      expect(tools, field).toContain(field)
+    }
   })
 
   it("pins the image by digest and follows the latest tag", () => {

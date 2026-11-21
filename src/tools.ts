@@ -1301,7 +1301,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     name: "login_start",
     title: "Start the claude.ai sign-in",
     description:
-      "Start the claude.ai sign-in of this service and get the address the owner signs in at. Hand it to the owner. After signing in, the page shows a code: the owner types it into PCP's secret for it (never into the chat), and the wrapper the owner approved finishes the sign-in with it (login_finish). The sign-in waits 15 minutes; starting again ends a waiting one. It changes nothing until it is finished.",
+      "Start the claude.ai sign-in of this service and get the address the owner signs in at. With PCP, PCP's own sign-in page calls it and takes the code; an assistant asks with PCP's connect_account instead. Otherwise hand the address to the owner: after signing in, the page shows a code, which login_finish takes. The sign-in waits 15 minutes; starting again ends a waiting one. It changes nothing until it is finished.",
     input: z.strictObject({}),
     output: z.object({
       url: z.string().describe("The address the owner signs in at."),
@@ -1316,7 +1316,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       return {
         url,
         expires_at: new Date(expiresAt).toISOString(),
-        next: "Give the owner this address. They sign in with their claude.ai account and get a code. The code is theirs to type into PCP's secret (not into this chat); then the sign-in is finished through the wrapper they approved, which hands login_finish that secret.",
+        next: "Give the owner this address. They sign in with their claude.ai account and get a code, which finishes the sign-in through login_finish: with PCP, typed on PCP's sign-in page, never into a chat.",
       }
     },
   }
@@ -1325,14 +1325,14 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     name: "login_finish",
     title: "Finish the claude.ai sign-in",
     description:
-      'Finish the sign-in login_start began, with the code the sign-in page showed the owner. Called by the owner\'s wrapper with the code as a PCP secret ({"$secret": …}), never with a code typed into a chat. Replaces any earlier login of the service.',
+      "Finish the sign-in login_start began, with the code the sign-in page showed the owner. With PCP, PCP's own sign-in page calls it with the code the owner pastes there, never an assistant, so its level for every token can stay blocked. Replaces any earlier login of the service.",
     input: z.strictObject({
       code: z
         .string()
         .min(1)
         .max(800)
         .describe(
-          "The sign-in code, code#state, as the page shows it. Only through PCP's secret binding.",
+          "The sign-in code, code#state, as the page shows it. With PCP, only from PCP's sign-in page.",
         ),
     }),
     output: z.object({
