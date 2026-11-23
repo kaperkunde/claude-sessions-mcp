@@ -209,10 +209,18 @@ export class FakeAnthropic {
     if (url.pathname === "/v1/environment_providers") {
       if (request.method !== "GET") return error(405, "method")
       const limit = Number(url.searchParams.get("limit") ?? "20")
+      const idOf = (e: Record<string, unknown>) =>
+        (e.environment_id ?? e.pool_id) as string
+      const after = url.searchParams.get("after_id")
+      const start =
+        after === null
+          ? 0
+          : this.environments.findIndex((e) => idOf(e) === after) + 1
+      const page = this.environments.slice(start, start + limit)
       return json(200, {
-        environments: this.environments.slice(0, limit),
-        has_more: false,
-        last_id: this.environments.at(-1)?.environment_id ?? null,
+        environments: page,
+        has_more: start + limit < this.environments.length,
+        last_id: page.length ? idOf(page.at(-1)!) : null,
       })
     }
     if (url.pathname === "/v1/code/sessions" && request.method === "POST")
@@ -372,11 +380,24 @@ export class FakeAnthropic {
     if (this.createFailure)
       return error(this.createFailure.status, this.createFailure.message)
     const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>
-    const allowed = ["title", "environment_id", "events", "config"]
+    const allowed = [
+      "title",
+      "environment_id",
+      "self_hosted_runner_pool_id",
+      "events",
+      "config",
+    ]
     for (const key of Object.keys(body))
       if (!allowed.includes(key)) return error(400, `unknown field ${key}`)
+    const wanted = body.self_hosted_runner_pool_id ?? body.environment_id
+    if (
+      "self_hosted_runner_pool_id" in body === "environment_id" in body ||
+      (typeof wanted === "string" && wanted.startsWith("ccpool_")) !==
+        "self_hosted_runner_pool_id" in body
+    )
+      return error(400, "environment_id or self_hosted_runner_pool_id")
     const environment = this.environments.find(
-      (e) => e.environment_id === body.environment_id,
+      (e) => (e.environment_id ?? e.pool_id) === wanted,
     )
     if (!environment) return error(404, "environment not found")
     if (typeof body.title !== "string" || body.title === "")
@@ -418,7 +439,7 @@ export class FakeAnthropic {
     const id = `cse_new${String(this.seq++).padStart(8, "0")}`
     this.addSession(id, {
       title: body.title,
-      environment_id: body.environment_id,
+      environment_id: wanted,
       environment_kind: environment.kind,
       config: { sources: [source] },
     })

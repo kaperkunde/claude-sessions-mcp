@@ -10,7 +10,8 @@ import {
   type ApiEvent,
   type SessionsApi,
 } from "./api.ts"
-import { CliRefusal, ENVIRONMENT_ID, checkStart, type Cli } from "./cli.ts"
+import { CliRefusal, type Cli } from "./cli.ts"
+import { ENVIRONMENT_ID, StartRefusal, checkStart } from "./start.ts"
 import { RenewalError, SignedOut, type Credentials } from "./credentials.ts"
 import { EgressError } from "./egress.ts"
 import {
@@ -808,16 +809,13 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     }),
     annotations: WRITE,
     async run(args) {
-      checkStart(
-        args.repo as string,
-        args.task as string,
-        args.branch as string,
-      )
+      const task = (args.task as string).trim()
+      checkStart(args.repo as string, task, args.branch as string)
       const requested = args.environment_id as string | undefined
       if (requested !== undefined && !ENVIRONMENT_ID.test(requested))
         throw new ToolRefusal("environment_id is an id from list_environments.")
       // Every check is made before the one request that starts anything.
-      const known = (await api.environments(100)).map(environmentView)
+      const known = (await api.allEnvironments()).map(environmentView)
       let environmentId: string
       if (requested !== undefined) {
         if (!known.some((e) => e.id === requested))
@@ -836,7 +834,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       const created = await api.createSession({
         repo: args.repo as string,
         branch: args.branch as string,
-        task: args.task as string,
+        task,
         environmentId,
       })
       const started = {
@@ -1402,7 +1400,11 @@ export async function runTool(
       structuredContent: value,
     }
   } catch (error) {
-    if (error instanceof ToolRefusal || error instanceof CliRefusal)
+    if (
+      error instanceof ToolRefusal ||
+      error instanceof CliRefusal ||
+      error instanceof StartRefusal
+    )
       return errorResult(error.message)
     if (error instanceof SignedOut) {
       logger.warn("signed_out", { tool: spec.name })

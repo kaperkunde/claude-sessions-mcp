@@ -66,6 +66,12 @@ function failure(
   const suffix = said ? ` (${said})` : ""
   const events = kind === "events"
   if (kind === "create") {
+    // A timeout or a server error: the request may have been taken.
+    if (status === 408 || status >= 500)
+      return new ApiError(
+        status,
+        `The sessions API answered ${status}${suffix}, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.`,
+      )
     switch (status) {
       case 400:
       case 404:
@@ -281,7 +287,10 @@ export class SessionsApi {
         "/v1/code/sessions",
         {
           title,
-          environment_id: input.environmentId,
+          // As the CLI names it: a self-hosted pool is another field.
+          ...(input.environmentId.startsWith("ccpool_")
+            ? { self_hosted_runner_pool_id: input.environmentId }
+            : { environment_id: input.environmentId }),
           events: [
             {
               payload: {
@@ -365,6 +374,30 @@ export class SessionsApi {
   /** Sets a session's title, as the CLI does (PUT with the title alone). */
   async rename(id: string, title: string): Promise<void> {
     await this.call("PUT", `/v1/code/sessions/${id}`, { title })
+  }
+
+  /** Every environment, paged as the CLI pages them (100 a page, after_id). */
+  async allEnvironments(): Promise<Record<string, unknown>[]> {
+    const all: Record<string, unknown>[] = []
+    let after: string | undefined
+    for (let page = 0; page < 10; page++) {
+      const { data } = await this.call(
+        "GET",
+        `/v1/environment_providers?limit=100${after !== undefined ? `&after_id=${after}` : ""}`,
+      )
+      const body = data as { has_more?: unknown; last_id?: unknown }
+      const found = objects((data as { environments?: unknown }).environments)
+      all.push(...found)
+      if (
+        body.has_more !== true ||
+        found.length === 0 ||
+        typeof body.last_id !== "string" ||
+        !CURSOR.test(body.last_id)
+      )
+        break
+      after = body.last_id
+    }
+    return all
   }
 
   /** The cloud environments the account can start sessions in. */

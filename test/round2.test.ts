@@ -226,7 +226,7 @@ describe("start_session", () => {
   it("checks the task, repo and branch before it asks for environments", async () => {
     const s = setup()
     for (const args of [
-      { repo: "kaperkunde/pcp", task: "/login" },
+      { repo: "kaperkunde/pcp", task: "  " },
       { repo: "not a repo", task: "go" },
       { repo: "kaperkunde/pcp", task: "go", branch: "--upload-pack=x" },
     ]) {

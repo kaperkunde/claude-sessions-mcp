@@ -259,10 +259,17 @@ from a laptop rather than in the cloud) may refuse events without that
 device's signature (403). `send_message`, `interrupt_session` and
 `ask_session` then say so; message it from that device or the Claude app.
 
-**start_session and slash commands.** A task that starts with `/` or `!`
-is refused, so a first message is never taken as a slash or shell command.
-No process is started for it: the session is created through the API, and
-what it may do in the cloud is the environment's and the repository's.
+**start_session.** The task is trimmed and must not be blank; it goes as a
+JSON message, so a leading `/` or `!` is just text. No process is started
+for it, and what the session may do in the cloud is the environment's and
+the repository's. The environment is looked for in every page of
+`GET /v1/environment_providers` (100 a page, `after_id`, at most ten
+pages). A `ccpool_…` id (a self-hosted pool) is sent as
+`self_hosted_runner_pool_id` instead of `environment_id`, as the CLI does.
+The outcome branch is `claude/task-<six random hex digits>`: the CLI asks a
+separate naming endpoint for a branch and falls back to `claude/task`, so
+this name is **unconfirmed** with the live API. A 5xx or 408 on the create
+says a session may have started: check `list_sessions`.
 
 Every request has a deadline (45 seconds at most, however slowly its
 bytes come in). `ask_session` and `interrupt_session` set theirs when they

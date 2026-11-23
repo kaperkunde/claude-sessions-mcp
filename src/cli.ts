@@ -69,31 +69,6 @@ type Child = {
 /** The sign-in code's shape: code#state, as the CLI asks for it. */
 export const SIGN_IN_CODE = /^[A-Za-z0-9_-]{8,512}#[A-Za-z0-9_-]{8,256}$/
 
-/** owner/name on GitHub. */
-export const GITHUB_REPO =
-  /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/
-/** A cloud environment's id, as list_environments answers them. */
-export const ENVIRONMENT_ID = /^[A-Za-z][A-Za-z0-9_-]{2,127}$/
-/** A branch name, conservatively. */
-export const BRANCH = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,200}$/
-
-/**
- * What start_session checks before anything else: a repository, a branch,
- * and a task that the CLI takes as a message (not / or !, a slash or a
- * shell command).
- */
-export function checkStart(repo: string, task: string, branch: string): void {
-  if (/^\s*[/!]/.test(task)) {
-    throw new CliRefusal(
-      "The task starts with / or !, which the CLI would take as a slash command or a shell command rather than the session's first message: start it with a word.",
-    )
-  }
-  if (!GITHUB_REPO.test(repo))
-    throw new CliRefusal("repo is a GitHub repository, as owner/name.")
-  if (!BRANCH.test(branch))
-    throw new CliRefusal("branch is a branch name, like main.")
-}
-
 /** The sign-in address in the CLI's output, if it names an allowed host. */
 export function loginUrl(output: string): string | undefined {
   for (const match of output.matchAll(/https:\/\/[^\s"'<>]+/g)) {

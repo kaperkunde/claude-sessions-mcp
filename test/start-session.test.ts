@@ -77,6 +77,79 @@ describe("start_session", () => {
     ])
   })
 
+  it("sends a task that starts with / or ! as it is: it is a JSON message", async () => {
+    const s = setup()
+    await s.ok("start_session", {
+      repo: "kaperkunde/pcp",
+      task: "  /login now ",
+    })
+    await s.ok("start_session", { repo: "kaperkunde/pcp", task: "!ls" })
+    const sent = s.fake.created.map(
+      (b) => (b as unknown as Created).events[0]!.payload.message.content,
+    )
+    // Trimmed, nothing else changed.
+    expect(sent).toEqual(["/login now", "!ls"])
+  })
+
+  it("sends a self-hosted pool as self_hosted_runner_pool_id, as the CLI does", async () => {
+    const s = setup()
+    s.fake.environments = [
+      { kind: "self_hosted_pool", pool_id: "ccpool_01Mine", name: "Mine" },
+    ]
+    await s.ok("start_session", {
+      repo: "kaperkunde/pcp",
+      task: "go",
+      environment_id: "ccpool_01Mine",
+    })
+    const body = s.fake.created[0] as Record<string, unknown>
+    expect(body.self_hosted_runner_pool_id).toBe("ccpool_01Mine")
+    expect(body).not.toHaveProperty("environment_id")
+  })
+
+  it("finds an environment past the first page", async () => {
+    const s = setup()
+    s.fake.environments = Array.from({ length: 250 }, (_, i) => ({
+      kind: "anthropic_cloud",
+      environment_id: `env_${String(i).padStart(4, "0")}`,
+      name: `E${i}`,
+    }))
+    await s.ok("start_session", {
+      repo: "kaperkunde/pcp",
+      task: "go",
+      environment_id: "env_0240",
+    })
+    expect((s.fake.created[0] as unknown as Created).environment_id).toBe(
+      "env_0240",
+    )
+    expect(
+      errorText(
+        await s.call("start_session", {
+          repo: "kaperkunde/pcp",
+          task: "go",
+          environment_id: "env_0999",
+        }),
+      ),
+    ).toMatch(/No environment env_0999/)
+  })
+
+  it("says a session may have started on a 5xx or 408, and not on a refusal", async () => {
+    const s = setup()
+    for (const status of [408, 500, 502, 503]) {
+      s.fake.createFailure = { status, message: "upstream" }
+      const text = errorText(
+        await s.call("start_session", { repo: "kaperkunde/pcp", task: "go" }),
+      )
+      expect(text, String(status)).toMatch(/may have started/)
+      expect(text, String(status)).toMatch(/list_sessions/)
+    }
+    s.fake.createFailure = { status: 422, message: "bad" }
+    expect(
+      errorText(
+        await s.call("start_session", { repo: "kaperkunde/pcp", task: "go" }),
+      ),
+    ).not.toMatch(/may have started/)
+  })
+
   it("runs in the environment it is given", async () => {
     const s = setup()
     await s.ok("start_session", {
@@ -125,12 +198,10 @@ describe("start_session", () => {
     expect(s.fake.created).toHaveLength(0)
   })
 
-  it("refuses a task that would be a slash command, a repository or a branch that is not one, and sends nothing", async () => {
+  it("refuses a blank task, a repository or a branch that is not one, and sends nothing", async () => {
     const s = setup()
     for (const args of [
-      { repo: "kaperkunde/pcp", task: "/login" },
-      { repo: "kaperkunde/pcp", task: "  /config set x" },
-      { repo: "kaperkunde/pcp", task: "!cat ~/.claude" },
+      { repo: "kaperkunde/pcp", task: "   \n\t " },
       { repo: "https://github.com/kaperkunde/pcp", task: "x" },
       { repo: "kaperkunde/../x", task: "x" },
       { repo: "-x/y", task: "x" },
@@ -178,7 +249,6 @@ describe("start_session", () => {
       ],
       [422, "bad source", /not accept|could not be started/i],
       [429, "slow down", /Too many requests/],
-      [500, "boom", /answered 500/],
     ] as const) {
       s.fake.createFailure = { status, message }
       const text = errorText(
