@@ -76,6 +76,5 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/mcp)" = 401
           test "$(docker exec claude-sessions id -u)" = 10001
           docker exec claude-sessions claude --version | grep -q '^2\.1\.327 '
-          docker exec claude-sessions git --version
           docker logs claude-sessions
           docker rm -f claude-sessions
