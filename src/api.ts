@@ -1,4 +1,6 @@
-import { SignedOut, type Credentials } from "./credentials.ts"
+import { randomBytes, randomUUID } from "node:crypto"
+
+import { RenewalError, SignedOut, type Credentials } from "./credentials.ts"
 import type { HostKey, Transport } from "./egress.ts"
 import type { Logger } from "./log.ts"
 import { redact } from "./log.ts"
@@ -55,9 +57,32 @@ function apiMessage(body: string): string | undefined {
   return undefined
 }
 
-function failure(status: number, body: string, events: boolean): ApiError {
+function failure(
+  status: number,
+  body: string,
+  kind: "session" | "events" | "create",
+): ApiError {
   const said = apiMessage(body)
   const suffix = said ? ` (${said})` : ""
+  const events = kind === "events"
+  if (kind === "create") {
+    // A timeout or a server error: the request may have been taken.
+    if (status === 408 || status >= 500)
+      return new ApiError(
+        status,
+        `The sessions API answered ${status}${suffix}, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.`,
+      )
+    switch (status) {
+      case 400:
+      case 404:
+      case 409:
+      case 422:
+        return new ApiError(
+          status,
+          `The sessions API did not accept the new session (${status})${suffix}. Check that the repository is connected to the owner's Claude account on GitHub (claude.ai/code), and that the environment exists (list_environments). Nothing was started.`,
+        )
+    }
+  }
   switch (status) {
     case 403:
       return new ApiError(
@@ -105,7 +130,11 @@ export class SessionsApi {
     method: "GET" | "POST" | "PUT",
     path: string,
     body?: unknown,
-    options: { timeoutMs?: number; accept?: number[]; events?: boolean } = {},
+    options: {
+      timeoutMs?: number
+      accept?: number[]
+      kind?: "session" | "events" | "create"
+    } = {},
   ): Promise<{ status: number; data: unknown }> {
     let rejected: string | undefined
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -151,7 +180,7 @@ export class SessionsApi {
         (response.status >= 200 && response.status <= 299) ||
         (options.accept ?? []).includes(response.status)
       if (!accepted)
-        throw failure(response.status, response.body, options.events === true)
+        throw failure(response.status, response.body, options.kind ?? "session")
       if (!response.body || response.status > 299)
         return { status: response.status, data: {} }
       try {
@@ -231,8 +260,100 @@ export class SessionsApi {
       "POST",
       `/v1/code/sessions/${id}/events`,
       { events },
-      { events: true, ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+      { kind: "events", ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
     )
+  }
+
+  /**
+   * Starts a session on a GitHub repository, as the CLI's interactive
+   * --cloud does (Claude Code 2.1.327 to 2.1.330): POST /v1/code/sessions
+   * with the title, the environment, the task as the one first event
+   * ({payload: <a user message>}, in the create body: the CLI posts no
+   * later event) and the config: the repository and the branch to start
+   * from as the source, the repository and the branch the session works on
+   * as the outcome. The answer is {session: {id, title, …}}.
+   */
+  async createSession(input: {
+    repo: string
+    branch: string
+    task: string
+    environmentId: string
+  }): Promise<{ id: string; title: string | null }> {
+    const title = input.task.replace(/\s+/g, " ").trim().slice(0, 75)
+    let data: unknown
+    try {
+      ;({ data } = await this.call(
+        "POST",
+        "/v1/code/sessions",
+        {
+          title,
+          // As the CLI names it: a self-hosted pool is another field.
+          ...(input.environmentId.startsWith("ccpool_")
+            ? { self_hosted_runner_pool_id: input.environmentId }
+            : { environment_id: input.environmentId }),
+          events: [
+            {
+              payload: {
+                uuid: randomUUID(),
+                session_id: "",
+                type: "user",
+                parent_tool_use_id: null,
+                message: { role: "user", content: input.task },
+              },
+            },
+          ],
+          config: {
+            sources: [
+              {
+                type: "git_repository",
+                url: `https://github.com/${input.repo}`,
+                revision: input.branch,
+              },
+            ],
+            outcomes: [
+              {
+                type: "git_repository",
+                git_info: {
+                  type: "github",
+                  repo: input.repo,
+                  // The CLI's own fallback name when it has none made.
+                  branches: [`claude/task-${randomBytes(3).toString("hex")}`],
+                },
+              },
+            ],
+          },
+        },
+        { kind: "create" },
+      ))
+    } catch (error) {
+      if (
+        error instanceof ApiError ||
+        error instanceof SignedOut ||
+        error instanceof RenewalError
+      )
+        throw error
+      // The request may have been received: say so, so it is not repeated.
+      throw new ApiError(
+        0,
+        "The sessions API gave no answer, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.",
+      )
+    }
+    const session = (data as { session?: unknown }).session
+    const id =
+      session && typeof session === "object"
+        ? (session as { id?: unknown }).id
+        : undefined
+    if (typeof id !== "string" || !SESSION_ID.test(id)) {
+      throw new ApiError(
+        200,
+        "The sessions API answered with no usable session id, so a session may have started all the same: check list_sessions before trying again.",
+      )
+    }
+    const named = (session as { title?: unknown }).title
+    return {
+      id,
+      title: typeof named === "string" ? redact(named).slice(0, 200) : null,
+    }
   }
 
   /** Archives a session: true, or false when it already was. */
@@ -253,6 +374,30 @@ export class SessionsApi {
   /** Sets a session's title, as the CLI does (PUT with the title alone). */
   async rename(id: string, title: string): Promise<void> {
     await this.call("PUT", `/v1/code/sessions/${id}`, { title })
+  }
+
+  /** Every environment, paged as the CLI pages them (100 a page, after_id). */
+  async allEnvironments(): Promise<Record<string, unknown>[]> {
+    const all: Record<string, unknown>[] = []
+    let after: string | undefined
+    for (let page = 0; page < 10; page++) {
+      const { data } = await this.call(
+        "GET",
+        `/v1/environment_providers?limit=100${after !== undefined ? `&after_id=${after}` : ""}`,
+      )
+      const body = data as { has_more?: unknown; last_id?: unknown }
+      const found = objects((data as { environments?: unknown }).environments)
+      all.push(...found)
+      if (
+        body.has_more !== true ||
+        found.length === 0 ||
+        typeof body.last_id !== "string" ||
+        !CURSOR.test(body.last_id)
+      )
+        break
+      after = body.last_id
+    }
+    return all
   }
 
   /** The cloud environments the account can start sessions in. */

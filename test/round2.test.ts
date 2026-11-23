@@ -226,7 +226,7 @@ describe("start_session", () => {
   it("checks the task, repo and branch before it asks for environments", async () => {
     const s = setup()
     for (const args of [
-      { repo: "kaperkunde/pcp", task: "/login" },
+      { repo: "kaperkunde/pcp", task: "  " },
       { repo: "not a repo", task: "go" },
       { repo: "kaperkunde/pcp", task: "go", branch: "--upload-pack=x" },
     ]) {
@@ -239,14 +239,5 @@ describe("start_session", () => {
     expect(
       s.fake.requests.filter((r) => r.path.includes("environment_providers")),
     ).toHaveLength(0)
-  })
-
-  it("warns that a session may have started when the CLI runs out of time", async () => {
-    const s = setup({ fakeMode: "cloud-hang", startTimeoutMs: 500 })
-    const text = errorText(
-      await s.call("start_session", { repo: "kaperkunde/pcp", task: "go" }),
-    )
-    expect(text).toMatch(/may have started/)
-    expect(text).toMatch(/list_sessions/)
   })
 })

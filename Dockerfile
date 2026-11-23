@@ -74,11 +74,8 @@ LABEL org.opencontainers.image.source="https://github.com/kaperkunde/claude-sess
       org.opencontainers.image.licenses="MIT" \
       gg.pcp.claude-code.version="${CLAUDE_CODE_VERSION}"
 
-# git: start_session gives the CLI a scratch repository whose remote names
-# the session's repository. No package manager at run time: npm, npx,
-# corepack and yarn go.
-RUN apk add --no-cache git \
-    && rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx \
+# No package manager at run time: npm, npx, corepack and yarn go.
+RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx \
         /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-* \
     && adduser -D -u 10001 -h /home/claude -s /sbin/nologin claude \
     && mkdir -p /home/claude/.claude \

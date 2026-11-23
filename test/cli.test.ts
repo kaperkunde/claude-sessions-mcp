@@ -1,10 +1,9 @@
-import { existsSync, readdirSync, statSync } from "node:fs"
+import { statSync } from "node:fs"
 import { join } from "node:path"
 
 import { describe, expect, it } from "vitest"
 
-import { lastWords, loginUrl, parseStart } from "../src/cli.ts"
-import { REFRESH_MARGIN_MS } from "../src/credentials.ts"
+import { lastWords, loginUrl } from "../src/cli.ts"
 import { errorText, GOOD_CODE, setup } from "./helpers.ts"
 
 describe("the sign-in", () => {
@@ -111,86 +110,6 @@ describe("the sign-in", () => {
   })
 })
 
-describe("start_session", () => {
-  it("runs the CLI's --cloud with the task on standard input, in a scratch repository", async () => {
-    const s = setup()
-    const answer = await s.ok("start_session", {
-      repo: "kaperkunde/pcp",
-      task: "--help; rm -rf / # a task that looks like flags",
-    })
-    expect(answer).toEqual({
-      session_id: "cse_newsession01",
-      url: "https://claude.ai/code/cse_newsession01?from=cli",
-      title: "Fake task",
-    })
-    const run = s.cliRuns().find((r) => r.kind === "cloud")!
-    expect(run.args).toEqual(["-p", "--cloud", "--output-format", "json"])
-    expect(run.task).toBe("--help; rm -rf / # a task that looks like flags\n")
-    expect(run.remote).toBe("https://github.com/kaperkunde/pcp.git")
-    expect(run.originHead).toBe("ref: refs/remotes/origin/main")
-    // The scratch repository is gone afterwards.
-    const tmpRoot = (s.cli as unknown as { options: { tmpRoot: string } })
-      .options.tmpRoot
-    expect(readdirSync(tmpRoot)).toEqual([])
-    expect(existsSync(run.cwd as string)).toBe(false)
-  })
-
-  it("renews a token close to running out before the CLI runs", async () => {
-    const s = setup({ expiresInMs: REFRESH_MARGIN_MS - 1 })
-    await s.ok("start_session", { repo: "kaperkunde/pcp", task: "go" })
-    expect(s.fake.renewals).toBe(1)
-    const run = s.cliRuns().find((r) => r.kind === "cloud")!
-    expect(run.accessToken).toBe(s.fake.accessToken)
-  })
-
-  it("passes on the CLI's error", async () => {
-    const s = setup({ fakeMode: "cloud-fail" })
-    expect(
-      errorText(
-        await s.call("start_session", { repo: "kaperkunde/pcp", task: "go" }),
-      ),
-    ).toBe(
-      "The Claude Code CLI did not start a session: No cloud environment is set up.",
-    )
-  })
-
-  it("reads the CLI's text answer too", async () => {
-    const s = setup({ fakeMode: "cloud-text" })
-    expect(
-      await s.ok("start_session", { repo: "kaperkunde/pcp", task: "go" }),
-    ).toEqual({
-      session_id: "cse_textsession01",
-      url: "https://claude.ai/code/cse_textsession01",
-      title: null,
-    })
-  })
-
-  it("refuses a repository or branch that is not one, before anything runs", async () => {
-    const s = setup()
-    for (const [repo, branch] of [
-      ["https://github.com/kaperkunde/pcp", "main"],
-      ["kaperkunde/../x", "main"],
-      ["-x/y", "main"],
-      ["kaperkunde/pcp", "--upload-pack=x"],
-      ["kaperkunde/pcp", "a..b"],
-    ] as const) {
-      const result = await s.call("start_session", { repo, task: "x", branch })
-      expect(result.isError, `${repo} ${branch}`).toBe(true)
-    }
-    expect(s.cliRuns()).toHaveLength(0)
-  })
-
-  it("says to sign in when signed out, and runs nothing", async () => {
-    const s = setup({ signedIn: false })
-    expect(
-      errorText(
-        await s.call("start_session", { repo: "kaperkunde/pcp", task: "go" }),
-      ),
-    ).toMatch(/login_start/)
-    expect(s.cliRuns()).toHaveLength(0)
-  })
-})
-
 describe("reading the CLI", () => {
   it("takes a sign-in address only on the sign-in hosts, with a PKCE challenge", () => {
     expect(
@@ -213,14 +132,5 @@ describe("reading the CLI", () => {
       ),
     ).toBe("Error: token [token] refused")
     expect(lastWords("bad abc#def\n", ["abc#def"])).toBe("bad")
-  })
-
-  it("parses only a well-formed start", () => {
-    expect(parseStart('{"ok":true,"session_id":"../../x"}')).toBeUndefined()
-    expect(
-      parseStart(
-        '{"ok":true,"session_id":"cse_abcdef123","url":"https://evil.example/"}',
-      ),
-    ).toEqual({ sessionId: "cse_abcdef123" })
   })
 })

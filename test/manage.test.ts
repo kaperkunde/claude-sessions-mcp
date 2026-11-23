@@ -361,45 +361,4 @@ describe("environments", () => {
       "/v1/environment_providers?limit=50",
     )
   })
-
-  it("start_session runs in the one named, through the CLI's own setting", async () => {
-    const s = setup()
-    await s.ok("start_session", {
-      repo: "kaperkunde/pcp",
-      task: "go",
-      environment_id: "env_02NodeHeavy",
-    })
-    const run = s.cliRuns().find((r) => r.kind === "cloud")!
-    expect(run.args).toEqual([
-      "-p",
-      "--cloud",
-      "--output-format",
-      "json",
-      "--settings",
-      JSON.stringify({ remote: { defaultEnvironmentId: "env_02NodeHeavy" } }),
-    ])
-  })
-
-  it("start_session refuses an environment the account does not have", async () => {
-    const s = setup()
-    expect(
-      errorText(
-        await s.call("start_session", {
-          repo: "kaperkunde/pcp",
-          task: "go",
-          environment_id: "env_99Unknown",
-        }),
-      ),
-    ).toMatch(/No environment env_99Unknown/)
-    expect(
-      errorText(
-        await s.call("start_session", {
-          repo: "kaperkunde/pcp",
-          task: "go",
-          environment_id: '{"x":1}',
-        }),
-      ),
-    ).toMatch(/list_environments/)
-    expect(s.cliRuns()).toHaveLength(0)
-  })
 })

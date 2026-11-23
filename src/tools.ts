@@ -10,7 +10,8 @@ import {
   type ApiEvent,
   type SessionsApi,
 } from "./api.ts"
-import { CliRefusal, ENVIRONMENT_ID, checkStart, type Cli } from "./cli.ts"
+import { CliRefusal, type Cli } from "./cli.ts"
+import { ENVIRONMENT_ID, StartRefusal, checkStart } from "./start.ts"
 import { RenewalError, SignedOut, type Credentials } from "./credentials.ts"
 import { EgressError } from "./egress.ts"
 import {
@@ -773,7 +774,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     name: "start_session",
     title: "Start a Claude Code cloud session",
     description:
-      "Start a new Claude Code cloud session on a GitHub repository with a task as its first message, through the Claude Code CLI's --cloud, in the cloud environment the account uses by default or the one environment_id names (list_environments). It starts working at once, on the owner's plan. Start only what the owner asked for; check list_sessions before trying again after a failure.",
+      "Start a new Claude Code cloud session on a GitHub repository with a task as its first message, in the account's first Anthropic cloud environment or the one environment_id names (list_environments). It starts working at once, on the owner's plan. Start only what the owner asked for; check list_sessions before trying again after a failure.",
     input: z.strictObject({
       repo: z
         .string()
@@ -798,7 +799,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
         .max(128)
         .optional()
         .describe(
-          "The cloud environment to run in, an id from list_environments. Left out: the one the account uses by default.",
+          "The cloud environment to run in, an id from list_environments. Left out: the account's first Anthropic cloud one (kind anthropic_cloud).",
         ),
     }),
     output: z.object({
@@ -808,29 +809,39 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     }),
     annotations: WRITE,
     async run(args) {
-      checkStart(
-        args.repo as string,
-        args.task as string,
-        args.branch as string,
-      )
-      const environmentId = args.environment_id as string | undefined
-      if (environmentId !== undefined) {
-        if (!ENVIRONMENT_ID.test(environmentId))
+      const task = (args.task as string).trim()
+      checkStart(args.repo as string, task, args.branch as string)
+      const requested = args.environment_id as string | undefined
+      if (requested !== undefined && !ENVIRONMENT_ID.test(requested))
+        throw new ToolRefusal("environment_id is an id from list_environments.")
+      // Every check is made before the one request that starts anything.
+      const known = (await api.allEnvironments()).map(environmentView)
+      let environmentId: string
+      if (requested !== undefined) {
+        if (!known.some((e) => e.id === requested))
           throw new ToolRefusal(
-            "environment_id is an id from list_environments.",
+            `No environment ${requested}: use an id from list_environments.`,
           )
-        const known = (await api.environments(100)).map(environmentView)
-        if (!known.some((e) => e.id === environmentId))
+        environmentId = requested
+      } else {
+        const first = known.find((e) => e.kind === "anthropic_cloud" && e.id)
+        if (!first)
           throw new ToolRefusal(
-            `No environment ${environmentId}: use an id from list_environments.`,
+            "The account has no cloud environment to start a session in: set one up on claude.ai/code, or name one with environment_id (list_environments).",
           )
+        environmentId = first.id
       }
-      const started = await cli.startSession(
-        args.repo as string,
-        args.task as string,
-        args.branch as string,
+      const created = await api.createSession({
+        repo: args.repo as string,
+        branch: args.branch as string,
+        task,
         environmentId,
-      )
+      })
+      const started = {
+        sessionId: created.id,
+        url: SESSION_URL(created.id) ?? undefined,
+        title: created.title ?? undefined,
+      }
       return {
         session_id: started.sessionId,
         url: started.url ?? null,
@@ -1389,7 +1400,11 @@ export async function runTool(
       structuredContent: value,
     }
   } catch (error) {
-    if (error instanceof ToolRefusal || error instanceof CliRefusal)
+    if (
+      error instanceof ToolRefusal ||
+      error instanceof CliRefusal ||
+      error instanceof StartRefusal
+    )
       return errorResult(error.message)
     if (error instanceof SignedOut) {
       logger.warn("signed_out", { tool: spec.name })
