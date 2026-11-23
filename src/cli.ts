@@ -1,22 +1,14 @@
 import { spawn } from "node:child_process"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 
-import {
-  REFRESH_MARGIN_MS,
-  RenewalError,
-  SignedOut,
-  type Credentials,
-} from "./credentials.ts"
+import type { Credentials } from "./credentials.ts"
 import { SIGN_IN_HOSTS } from "./egress.ts"
 import type { Logger } from "./log.ts"
 import { redact } from "./log.ts"
 
 /**
  * The only module that starts a process: the Claude Code CLI (pinned in
- * the image) for the claude.ai sign-in and to start a cloud session, and
- * git, to give that session its repository. Every process is started with
+ * the image), for the claude.ai sign-in only: a session is started through
+ * the sessions API (api.ts), as `claude -p --cloud` cannot start one. Every process is started with
  * an argument list (never a shell), a fixed set of environment variables
  * (never the MCP token), a time limit and bounded output.
  *
@@ -28,7 +20,6 @@ import { redact } from "./log.ts"
 export const LOGIN_URL_WAIT_MS = 30_000
 export const LOGIN_TTL_MS = 15 * 60 * 1000
 export const LOGIN_FINISH_MS = 60_000
-export const START_SESSION_MS = 180_000
 export const MAX_OUTPUT_BYTES = 256 * 1024
 
 /** A failure the assistant can act on: answered as a tool error. */
@@ -44,10 +35,6 @@ export type CliOptions = {
   configDir: string
   credentials: Credentials
   logger: Logger
-  /** start_session's time limit for the CLI; START_SESSION_MS by default. */
-  startTimeoutMs?: number
-  /** Where a session's scratch repository is made; the system's by default. */
-  tmpRoot?: string
   now?: () => number
   /** The environment handed on to the CLI, from the service's own. */
   env?: Record<string, string | undefined>
@@ -359,168 +346,4 @@ export class Cli {
     }
     this.options.logger.info("login_finished")
   }
-
-  private async git(cwd: string, args: string[]): Promise<void> {
-    const child = this.start("git", args, cwd, {
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
-      GIT_TERMINAL_PROMPT: "0",
-    })
-    const result = await this.within(child.wait(), 15_000, () => child.kill())
-    if (!result || result.code !== 0) {
-      throw new CliRefusal(
-        `Preparing the repository failed (git ${args[0]}): ${lastWords(child.output())}`,
-      )
-    }
-  }
-
-  /**
-   * Starts a cloud session on `repo` with `task` as its first message:
-   * `claude -p --cloud --output-format json`, the task on standard input,
-   * in a scratch folder whose git remote is the repository on GitHub (the
-   * CLI takes the session's repository from there). The environment is the
-   * one the CLI picks (the account's default cloud environment).
-   */
-  async startSession(
-    repo: string,
-    task: string,
-    branch: string,
-    environmentId?: string,
-  ): Promise<{ sessionId: string; url?: string; title?: string }> {
-    checkStart(repo, task, branch)
-    if (environmentId !== undefined && !ENVIRONMENT_ID.test(environmentId))
-      throw new CliRefusal("environment_id is an id from list_environments.")
-    const root = this.options.tmpRoot ?? tmpdir()
-    const dir = mkdtempSync(join(root, "claude-sessions-"))
-    try {
-      await this.git(dir, ["init", "-q", "-b", branch])
-      await this.git(dir, [
-        "remote",
-        "add",
-        "origin",
-        `https://github.com/${repo}.git`,
-      ])
-      await this.git(dir, [
-        "symbolic-ref",
-        "refs/remotes/origin/HEAD",
-        `refs/remotes/origin/${branch}`,
-      ])
-      const result = await this.options.credentials.serial.run(async () => {
-        // A token that lasts the whole run, so the CLI does not renew it.
-        await this.options.credentials.tokenInLine(
-          undefined,
-          REFRESH_MARGIN_MS + START_SESSION_MS,
-        )
-        const child = this.claude(
-          [
-            "-p",
-            "--cloud",
-            "--output-format",
-            "json",
-            // The environment the CLI's /remote-env would set, for this
-            // run only (flag settings are a source it trusts for it).
-            ...(environmentId !== undefined
-              ? [
-                  "--settings",
-                  JSON.stringify({
-                    remote: { defaultEnvironmentId: environmentId },
-                  }),
-                ]
-              : []),
-          ],
-          dir,
-        )
-        child.write(task)
-        child.write("\n")
-        child.end()
-        const done = await this.within(
-          child.wait(),
-          this.options.startTimeoutMs ?? START_SESSION_MS,
-          () => child.kill(),
-        )
-        return done ?? { code: null, output: child.output() }
-      })
-      const started = parseStart(result.output)
-      if (result.code === 0 && started) {
-        this.options.logger.info("session_started")
-        return started
-      }
-      this.options.logger.warn("session_start_failed", {
-        exit: result.code ?? "timeout",
-      })
-      if (result.code === null) {
-        throw new CliRefusal(
-          "The Claude Code CLI did not finish in time, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.",
-        )
-      }
-      const said = startError(result.output) ?? lastWords(result.output)
-      throw new CliRefusal(
-        `The Claude Code CLI did not start a session${said ? `: ${said}` : ""}.`,
-      )
-    } catch (error) {
-      if (
-        error instanceof SignedOut ||
-        error instanceof RenewalError ||
-        error instanceof CliRefusal
-      )
-        throw error
-      throw new CliRefusal(
-        "Starting the session failed on the way. Check list_sessions before trying again, so it is not started twice.",
-      )
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  }
-}
-
-const SESSION_ID_LINE =
-  /^Session ID:\s*((?:cse|session)_[A-Za-z0-9]{6,120})\s*$/m
-const VIEW_LINE = /^View:\s*(https:\/\/claude\.ai\/\S+)\s*$/m
-
-/** What `claude -p --cloud --output-format json` printed, read. */
-export function parseStart(
-  output: string,
-): { sessionId: string; url?: string; title?: string } | undefined {
-  for (const line of output.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith("{")) continue
-    let data: Record<string, unknown>
-    try {
-      data = JSON.parse(trimmed) as Record<string, unknown>
-    } catch {
-      continue
-    }
-    if (data.ok !== true || typeof data.session_id !== "string") continue
-    if (!/^(?:cse|session)_[A-Za-z0-9]{6,120}$/.test(data.session_id)) continue
-    return {
-      sessionId: data.session_id,
-      ...(typeof data.url === "string" &&
-      data.url.startsWith("https://claude.ai/")
-        ? { url: data.url }
-        : {}),
-      ...(typeof data.title === "string"
-        ? { title: data.title.slice(0, 200) }
-        : {}),
-    }
-  }
-  const id = SESSION_ID_LINE.exec(output)?.[1]
-  if (!id) return undefined
-  const url = VIEW_LINE.exec(output)?.[1]
-  return { sessionId: id, ...(url ? { url } : {}) }
-}
-
-/** The error a failed `--output-format json` start printed, if any. */
-function startError(output: string): string | undefined {
-  for (const line of output.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed.startsWith("{")) continue
-    try {
-      const data = JSON.parse(trimmed) as Record<string, unknown>
-      if (data.ok === false && typeof data.error === "string")
-        return redact(data.error).slice(0, 300)
-    } catch {
-      continue
-    }
-  }
-  return undefined
 }

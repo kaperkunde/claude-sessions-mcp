@@ -38,7 +38,7 @@ pinned in the image and why there is a smoke test to run after updating it
 | `interrupt_session` | Write | **ask**         | Stops the current turn (as Esc does) and drops queued messages; background tasks keep running.                                                                                                                                                                                                          |
 | `answer_permission` | Write | **ask**         | Allows once (with `expected_input`, the shown input echoed back exactly), or denies with a message, the permission prompt a session waits on: only the one `request_id` names, only while it still waits on it, and only once.                                                                          |
 | `answer_question`   | Write | **ask**         | Answers the questions a session asks you (`AskUserQuestion`), or declines them with a message: every question once, by its exact text, with `choices` among its labels (one unless `multi_select`) or your own `text`; only the one `request_id` names, only while it still waits on it, and only once. |
-| `start_session`     | Write | **ask**         | A new cloud session on a GitHub `repo` (owner/name) with `task` as its first message, through `claude --cloud`, in your default cloud environment or the one `environment_id` names. `branch` is the repository's default branch (`main` if left out).                                                  |
+| `start_session`     | Write | **ask**         | A new cloud session on a GitHub `repo` (owner/name) with `task` as its first message, created through the sessions API, in your first Anthropic cloud environment or the one `environment_id` names. `branch` is the repository's default branch (`main` if left out).                                  |
 | `archive_session`   | Write | **ask**         | Archives a session, as on claude.ai/code: it stops and leaves the list. Nothing is deleted.                                                                                                                                                                                                             |
 | `unarchive_session` | Write | **ask**         | Brings an archived session back. claude.ai may ask for a trusted device for this; it then says to do it on claude.ai/code.                                                                                                                                                                              |
 | `rename_session`    | Write | **ask**         | Sets a session's title (one line, up to 200 characters).                                                                                                                                                                                                                                                |
@@ -56,7 +56,10 @@ archived or renamed without your yes.
 
 Every request a tool makes is one the pinned CLI (2.1.327) makes itself:
 the paths, bodies and fields were read out of its bundle, not guessed
-(see "The API it relies on"). What the CLI does not do, the service does
+(see "The API it relies on"). `start_session`'s is the one the CLI's
+interactive `--cloud` makes, read out of the 2.1.330 bundle (`claude -p`
+cannot start a session); it was not run against the live API when it was
+written, so check it with the smoke test after any change. What the CLI does not do, the service does
 not offer: there is no tool to delete a session, and no pull-request
 links, which the session record does not carry.
 
@@ -202,14 +205,11 @@ once more when the API answers 401. **The refresh token rotates on every
 use, and a refresh token used twice can end the login**, so:
 
 - an API call reads a token that needs no renewal straight from the file,
-  so it never waits behind a CLI run; every renewal, the sign-in's finish
-  and every CLI run that uses the login (`start_session`) go through one
-  queue, one at a time;
+  so it never waits behind a CLI run; every renewal and the sign-in's
+  finish go through one queue, one at a time;
 - each renewal reads the file again first, so a token the CLI renewed is
   taken as it is; a renewed token is written whole, synced to disk, then
   renamed into place;
-- before the CLI runs, the token is renewed if it would lapse before the
-  run's time limit is up, so the CLI never renews it itself;
 - a renewal that gets no usable answer (none, one that is not JSON or has
   no token, or one that cannot be written down), after which claude.ai may
   have rotated the token all the same, is never sent again: the refresh
@@ -238,45 +238,39 @@ anthropic-beta: ccr-byoc-2025-07-29
 x-organization-uuid: <oauthAccount.organizationUuid>
 ```
 
-| Tool                | Request                                                                                                                                                                                                                                                                                                                                 |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list_sessions`     | `GET /v1/code/sessions?limit=N`                                                                                                                                                                                                                                                                                                         |
-| `get_session`       | `GET /v1/code/sessions/{id}`                                                                                                                                                                                                                                                                                                            |
-| `session_status`    | `GET /v1/code/sessions/{id}` and `GET /v1/code/sessions/{id}/events?limit=N&sort_order=desc` (`&cursor=` the last answer's `next_cursor` for older events)                                                                                                                                                                              |
-| `ask_session`       | the newest event's `sequence_num` noted, then `POST /v1/code/sessions/{id}/events` with `{"events":[{"event_type":"control_request","payload":{…,"request":{"subtype":"side_question","question":…,"history":[]}}}]}`, then `…/events?sort_order=asc&cursor=<seq>` paged forward until the `control_response` with its `request_id`     |
-| `send_message`      | the same POST with `event_type` `user`: `{type:"user", parent_tool_use_id:null, message:{role:"user", content}, priority?}`                                                                                                                                                                                                             |
-| `interrupt_session` | a `control_request` `{subtype:"interrupt", cancel_queued:true, spare_background_tasks:true, send_now:true}`, as the CLI sends it; its `control_response` awaited for 15 seconds                                                                                                                                                         |
-| `answer_permission` | a `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput, toolUseID, tool_name}}` or `{behavior:"deny", message, toolUseID}`, for the prompt in the record's `external_metadata.pending_action`                                                                                                   |
-| `answer_question`   | the same `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput:{…input, answers:{<question>: <answer>}}, toolUseID}}` or `{behavior:"deny", message, toolUseID}`, for a `pending_action` whose `tool_name` is `AskUserQuestion`                                                                  |
-| `archive_session`   | `POST /v1/code/sessions/{id}/archive` with `{}` (409: it already was)                                                                                                                                                                                                                                                                   |
-| `unarchive_session` | `POST /v1/code/sessions/{id}/unarchive` with `{}`                                                                                                                                                                                                                                                                                       |
-| `rename_session`    | `PUT /v1/code/sessions/{id}` with `{"title": …}`                                                                                                                                                                                                                                                                                        |
-| `list_environments` | `GET /v1/environment_providers?limit=N`                                                                                                                                                                                                                                                                                                 |
-| `start_session`     | `claude -p --cloud --output-format json`, the task on standard input, in a scratch git repository whose `origin` is `https://github.com/<repo>.git` (the CLI takes the session's repository from there); with `environment_id`, `--settings {"remote":{"defaultEnvironmentId":…}}`, the setting `/remote-env` writes, for that run only |
+| Tool                | Request                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_sessions`     | `GET /v1/code/sessions?limit=N`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `get_session`       | `GET /v1/code/sessions/{id}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `session_status`    | `GET /v1/code/sessions/{id}` and `GET /v1/code/sessions/{id}/events?limit=N&sort_order=desc` (`&cursor=` the last answer's `next_cursor` for older events)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ask_session`       | the newest event's `sequence_num` noted, then `POST /v1/code/sessions/{id}/events` with `{"events":[{"event_type":"control_request","payload":{…,"request":{"subtype":"side_question","question":…,"history":[]}}}]}`, then `…/events?sort_order=asc&cursor=<seq>` paged forward until the `control_response` with its `request_id`                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `send_message`      | the same POST with `event_type` `user`: `{type:"user", parent_tool_use_id:null, message:{role:"user", content}, priority?}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `interrupt_session` | a `control_request` `{subtype:"interrupt", cancel_queued:true, spare_background_tasks:true, send_now:true}`, as the CLI sends it; its `control_response` awaited for 15 seconds                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `answer_permission` | a `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput, toolUseID, tool_name}}` or `{behavior:"deny", message, toolUseID}`, for the prompt in the record's `external_metadata.pending_action`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `answer_question`   | the same `control_response` `{subtype:"success", request_id, response:{behavior:"allow", updatedInput:{…input, answers:{<question>: <answer>}}, toolUseID}}` or `{behavior:"deny", message, toolUseID}`, for a `pending_action` whose `tool_name` is `AskUserQuestion`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `archive_session`   | `POST /v1/code/sessions/{id}/archive` with `{}` (409: it already was)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `unarchive_session` | `POST /v1/code/sessions/{id}/unarchive` with `{}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `rename_session`    | `PUT /v1/code/sessions/{id}` with `{"title": …}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `list_environments` | `GET /v1/environment_providers?limit=N`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `start_session`     | `GET /v1/environment_providers` (the environment checked, or the first `anthropic_cloud` one taken), then one `POST /v1/code/sessions` with `{"title":<the task's first 75 characters>,"environment_id":…,"events":[{"payload":{"uuid":…,"session_id":"","type":"user","parent_tool_use_id":null,"message":{"role":"user","content":<task>}}}],"config":{"sources":[{"type":"git_repository","url":"https://github.com/<repo>","revision":<branch>}],"outcomes":[{"type":"git_repository","git_info":{"type":"github","repo":"<repo>","branches":["claude/task-<random>"]}}]}}`, answered `{"session":{"id":"cse_…",…}}`; the task is the create body's own first event, as in the CLI's interactive `--cloud` (`claude -p --cloud` cannot start a session) |
 
 **Device-bound sessions.** A session bound to another machine (one started
 from a laptop rather than in the cloud) may refuse events without that
 device's signature (403). `send_message`, `interrupt_session` and
 `ask_session` then say so; message it from that device or the Claude app.
 
-**start_session and the CLI's own tools.** A task that starts with `/` or
-`!` is refused, since the CLI would take it as a slash or shell command.
-The CLI cannot be started with no local tools here: in 2.1.327 `--tools`,
-`--permission-mode` and `--disallowedTools` are handed on to the cloud
-session (they would limit it, not the local run), and `--restricted`,
-`--bare` and `--permission-prompts none` are refused with `--cloud`. So
-the service relies on print mode's own rule (a tool that needs a
-permission prompt is denied, with no one to answer) and an empty scratch
-folder as the working directory; files outside it, the login included,
-need a prompt.
+**start_session and slash commands.** A task that starts with `/` or `!`
+is refused, so a first message is never taken as a slash or shell command.
+No process is started for it: the session is created through the API, and
+what it may do in the cloud is the environment's and the repository's.
 
 Every request has a deadline (45 seconds at most, however slowly its
 bytes come in). `ask_session` and `interrupt_session` set theirs when they
 start, and every request they make (the newest event, the POST, each
 poll) gets only what is left; a page whose cursor does not move ends the
-paging until the next poll. If the CLI runs past `start_session`'s time
-limit, the answer says a session may have started: check `list_sessions`
-before trying again.
+paging until the next poll. If `start_session`'s request gets no answer, the
+answer says a session may have started: check `list_sessions` before
+trying again.
 
 `ask_session` usually answers in about ten seconds. If your PCP gives the
 service a shorter time limit than `timeout_seconds`, raise the limit on the
@@ -327,13 +321,12 @@ URL; redirects are not followed; no proxy variable is read; certificates
 are checked; answers are capped at 8 MiB. ESLint and `test/egress.test.ts`
 keep every other module from dialling, a code convention, not a sandbox.
 
-The Claude Code CLI, which the service runs for the sign-in and for
-`start_session` (`src/cli.ts`, the only module that starts a process,
+The Claude Code CLI, which the service runs for the sign-in only
+(`src/cli.ts`, the only module that starts a process,
 always with an argument list and never a shell), makes its own connections
 to Anthropic's hosts, as it does on any machine; its updater, telemetry and
 error reports are off (`DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`,
-`DISABLE_ERROR_REPORTING`). `start_session` runs git only to make the
-scratch repository; it fetches nothing.
+`DISABLE_ERROR_REPORTING`).
 
 ## Logs
 
@@ -430,7 +423,7 @@ gh attestation verify oci://ghcr.io/kaperkunde/claude-sessions-mcp@sha256:<diges
 
 Node 24 on Alpine, the base pinned by digest; production dependencies from
 the lock file only; the CLI's native binary from npm, checked against the
-pinned integrity, with no install script run; git; no npm, npx, corepack
+pinned integrity, with no install script run; no npm, npx, corepack
 or yarn left in it; runs as uid 10001.
 
 ## Developing
@@ -445,8 +438,7 @@ the sessions API and the token address (`test/fake-api.ts`), which checks
 the headers, expires tokens, rotates the refresh token and revokes the
 login when one is used twice; and against a fake CLI run as a real child
 process (`test/fake-claude.mjs`), which prints a sign-in address, reads the
-code and writes a login as the CLI does, and answers `--cloud` as the CLI
-does. They cover every tool: the summaries and states, paging, the side
+code and writes a login as the CLI does. They cover every tool: the summaries and states, paging, the side
 question in a busy session, messages (with priority) and interrupts,
 permission prompts and questions, stalled sessions, archive, unarchive
 and rename, environments, the 403

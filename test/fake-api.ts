@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- a body read as untrusted JSON, checked by hand */
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -76,6 +77,10 @@ export class FakeAnthropic {
   /** A renewal answers 200 with this body instead of the tokens. */
   renewalBody: string | undefined
   sessions = new Map<string, FakeSession>()
+  /** Every body POSTed to /v1/code/sessions that was accepted. */
+  created: Record<string, unknown>[] = []
+  /** Creating a session answers this status and message instead. */
+  createFailure: { status: number; message: string } | undefined
   environments: Record<string, unknown>[] = [
     {
       kind: "anthropic_cloud",
@@ -210,6 +215,8 @@ export class FakeAnthropic {
         last_id: this.environments.at(-1)?.environment_id ?? null,
       })
     }
+    if (url.pathname === "/v1/code/sessions" && request.method === "POST")
+      return this.create(request)
     const parts = url.pathname.split("/").filter(Boolean) // v1 code sessions [id] [events|archive|unarchive]
     if (parts.length === 3 && request.method === "GET") {
       if (this.forbidList) return error(403, "missing scope")
@@ -351,6 +358,74 @@ export class FakeAnthropic {
       }
     }
     return json(200, {})
+  }
+
+  /**
+   * POST /v1/code/sessions as the CLI's interactive --cloud sends it
+   * (Claude Code 2.1.327-2.1.330, "v1alpha2"): { title, environment_id,
+   * events: [{ payload: <the first user message> }], config: { sources,
+   * outcomes } }, answered { session: { id, title, … } }. The first
+   * message is in the body, never a later POST to the events. Anything
+   * else in the body is refused, as a strict API would.
+   */
+  private create(request: OutgoingRequest): IncomingResponse {
+    if (this.createFailure)
+      return error(this.createFailure.status, this.createFailure.message)
+    const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>
+    const allowed = ["title", "environment_id", "events", "config"]
+    for (const key of Object.keys(body))
+      if (!allowed.includes(key)) return error(400, `unknown field ${key}`)
+    const environment = this.environments.find(
+      (e) => e.environment_id === body.environment_id,
+    )
+    if (!environment) return error(404, "environment not found")
+    if (typeof body.title !== "string" || body.title === "")
+      return error(400, "title is required")
+    const events = body.events as { payload?: Record<string, unknown> }[]
+    if (!Array.isArray(events) || events.length !== 1)
+      return error(400, "events: exactly one first event")
+    const payload = events[0]!.payload as Record<string, any> | undefined
+    if (
+      Object.keys(events[0]!).join() !== "payload" ||
+      !payload ||
+      payload.type !== "user" ||
+      payload.session_id !== "" ||
+      payload.parent_tool_use_id !== null ||
+      typeof payload.uuid !== "string" ||
+      payload.message?.role !== "user" ||
+      typeof payload.message?.content !== "string"
+    )
+      return error(400, "events[0].payload is not a user message")
+    const config = body.config as Record<string, any> | undefined
+    const source = config?.sources?.[0]
+    const outcome = config?.outcomes?.[0]
+    if (
+      !config ||
+      Object.keys(config).sort().join() !== "outcomes,sources" ||
+      config.sources.length !== 1 ||
+      source?.type !== "git_repository" ||
+      !/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(source.url) ||
+      typeof source.revision !== "string" ||
+      config.outcomes.length !== 1 ||
+      outcome?.type !== "git_repository" ||
+      outcome.git_info?.type !== "github" ||
+      `https://github.com/${outcome.git_info.repo}` !== source.url ||
+      !Array.isArray(outcome.git_info.branches) ||
+      outcome.git_info.branches.length !== 1
+    )
+      return error(400, "config.sources / config.outcomes")
+    this.created.push(body)
+    const id = `cse_new${String(this.seq++).padStart(8, "0")}`
+    this.addSession(id, {
+      title: body.title,
+      environment_id: body.environment_id,
+      environment_kind: environment.kind,
+      config: { sources: [source] },
+    })
+    this.addEvent(id, payload)
+    return json(200, {
+      session: { id, title: body.title, status: "active" },
+    })
   }
 
   /** Puts a permission prompt on a session, as a worker waiting on one. */

@@ -73,7 +73,6 @@ export function setup(
     signedIn?: boolean
     expiresInMs?: number
     fakeMode?: string
-    startTimeoutMs?: number
     dir?: string
     transport?: (fake: FakeAnthropic) => Transport
   } = {},
@@ -112,10 +111,6 @@ export function setup(
     configDir: dir,
     credentials,
     logger,
-    tmpRoot: tempDir(),
-    ...(options.startTimeoutMs !== undefined
-      ? { startTimeoutMs: options.startTimeoutMs }
-      : {}),
     now: clock.now,
     env: {
       PATH: process.env.PATH,

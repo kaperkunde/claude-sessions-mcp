@@ -2,8 +2,6 @@ import { EventEmitter } from "node:events"
 
 import { describe, expect, it } from "vitest"
 
-import { START_SESSION_MS } from "../src/cli.ts"
-import { REFRESH_MARGIN_MS } from "../src/credentials.ts"
 import { EgressError, httpsTransport } from "../src/egress.ts"
 import { itemOf } from "../src/events.ts"
 import { errorText, GOOD_CODE, setup } from "./helpers.ts"
@@ -171,28 +169,6 @@ describe("the transport", () => {
       expect(poll.timeoutMs).toBeDefined()
       expect(poll.timeoutMs!).toBeLessThanOrEqual(5000)
     }
-  })
-})
-
-describe("start_session", () => {
-  it("refuses a task that would be a slash command", async () => {
-    const s = setup()
-    for (const task of ["/login", "  /config set x", "!cat ~/.claude"]) {
-      expect(
-        errorText(
-          await s.call("start_session", { repo: "kaperkunde/pcp", task }),
-        ),
-      ).toMatch(/slash command|starts with/)
-    }
-    expect(s.cliRuns()).toHaveLength(0)
-  })
-
-  it("renews when the token would lapse while the CLI runs", async () => {
-    const s = setup({
-      expiresInMs: REFRESH_MARGIN_MS + START_SESSION_MS - 1000,
-    })
-    await s.ok("start_session", { repo: "kaperkunde/pcp", task: "go" })
-    expect(s.fake.renewals).toBe(1)
   })
 })
 

@@ -1,12 +1,9 @@
 // A fake of the Claude Code CLI for the tests, run as a real child
 // process: `auth login --claudeai` prints a sign-in address and reads the
-// code from standard input as the CLI does; `-p --cloud --output-format
-// json` reads the task from standard input and prints the CLI's JSON line.
-// Every run is recorded in <CLAUDE_CONFIG_DIR>/fake-cli-runs.jsonl.
+// code from standard input as the CLI does. Every run is recorded in <CLAUDE_CONFIG_DIR>/fake-cli-runs.jsonl.
 //
-// The first argument may be --fake-mode=<mode>: no-url, cloud-fail,
-// cloud-text, cloud-hang, slow (a sign-in that takes 1.5 s to finish).
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs"
+// The first argument may be --fake-mode=<mode>: no-url, slow (a sign-in that takes 1.5 s to finish).
+import { appendFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { createInterface } from "node:readline"
 
@@ -29,14 +26,6 @@ function record(entry) {
       ...entry,
     }) + "\n",
   )
-}
-
-function readCredentials() {
-  try {
-    return JSON.parse(readFileSync(join(dir, ".credentials.json"), "utf8"))
-  } catch {
-    return undefined
-  }
 }
 
 if (args[0] === "auth" && args[1] === "login") {
@@ -97,61 +86,6 @@ if (args[0] === "auth" && args[1] === "login") {
   }
   // The write's callback ends the process.
   await new Promise(() => {})
-}
-
-if (args.includes("--cloud")) {
-  let task = ""
-  for await (const chunk of process.stdin) task += chunk
-  let remote = null
-  try {
-    remote = /url = (\S+)/.exec(
-      readFileSync(join(process.cwd(), ".git", "config"), "utf8"),
-    )?.[1]
-  } catch {
-    remote = null
-  }
-  let originHead = null
-  try {
-    originHead = readFileSync(
-      join(process.cwd(), ".git", "refs", "remotes", "origin", "HEAD"),
-      "utf8",
-    ).trim()
-  } catch {
-    originHead = null
-  }
-  const credentials = readCredentials()
-  record({
-    kind: "cloud",
-    task,
-    remote,
-    originHead,
-    accessToken: credentials?.claudeAiOauth?.accessToken,
-    expiresAt: credentials?.claudeAiOauth?.expiresAt,
-  })
-  if (mode === "cloud-fail") {
-    process.stdout.write(
-      JSON.stringify({ ok: false, error: "No cloud environment is set up" }) +
-        "\n",
-    )
-    process.exit(1)
-  }
-  if (mode === "cloud-hang")
-    await new Promise(() => setInterval(() => {}, 1000))
-  if (mode === "cloud-text") {
-    process.stdout.write(
-      "Created cloud session: Fake\nSession ID: cse_textsession01\nView: https://claude.ai/code/cse_textsession01\n",
-    )
-    process.exit(0)
-  }
-  process.stdout.write(
-    JSON.stringify({
-      ok: true,
-      session_id: "cse_newsession01",
-      title: "Fake task",
-      url: "https://claude.ai/code/cse_newsession01?from=cli",
-    }) + "\n",
-  )
-  process.exit(0)
 }
 
 process.stderr.write(`fake claude: unknown arguments ${args.join(" ")}\n`)
