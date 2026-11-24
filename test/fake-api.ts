@@ -2,7 +2,12 @@
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 
-import { API_BETA, API_VERSION, MCP_SERVERS_BETA } from "../src/api.ts"
+import {
+  API_BETA,
+  API_VERSION,
+  MCP_SERVERS_BETA,
+  TRIGGERS_BETA,
+} from "../src/api.ts"
 import { CLIENT_ID } from "../src/credentials.ts"
 import type {
   IncomingResponse,
@@ -220,9 +225,16 @@ export class FakeAnthropic {
       return error(401, "OAuth token has expired")
     if (h["anthropic-version"] !== API_VERSION) return error(400, "version")
     const url = new URL(request.path, "https://api.invalid")
+    // As the live API: a beta the path does not take is answered 404.
     const wantBeta =
-      url.pathname === "/v1/mcp_servers" ? MCP_SERVERS_BETA : API_BETA
-    if (h["anthropic-beta"] !== wantBeta) return error(400, "beta")
+      url.pathname === "/v1/mcp_servers"
+        ? MCP_SERVERS_BETA
+        : url.pathname.startsWith("/v1/code/triggers") ||
+            (url.pathname === "/v1/code/sessions" &&
+              url.searchParams.has("trigger_id"))
+          ? TRIGGERS_BETA
+          : API_BETA
+    if (h["anthropic-beta"] !== wantBeta) return error(404, "not found")
     if (h["x-organization-uuid"] !== ORG) return error(403, "organization")
     if (url.pathname === "/v1/mcp_servers") {
       if (request.method !== "GET") return error(405, "method")

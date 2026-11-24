@@ -17,6 +17,8 @@ export const API_VERSION = "2023-06-01"
 export const API_BETA = "ccr-byoc-2025-07-29"
 /** The beta of the connectors list (`GET /v1/mcp_servers`). */
 export const MCP_SERVERS_BETA = "mcp-servers-2025-12-04"
+/** The beta of the routines API (`/v1/code/triggers`, and a routine's runs), as the CLI sends it. */
+export const TRIGGERS_BETA = "ccr-triggers-2026-01-30"
 
 export type ApiEvent = Record<string, unknown>
 
@@ -394,6 +396,8 @@ export class SessionsApi {
     const { data } = await this.call(
       "GET",
       `/v1/code/sessions?trigger_id=${routineId}&limit=5`,
+      undefined,
+      { beta: TRIGGERS_BETA },
     )
     return objects((data as { data?: unknown }).data)
       .map((r) => sessionIdIn(r))
@@ -402,9 +406,12 @@ export class SessionsApi {
 
   /** Turns a routine off, so it shows as done. It is never deleted: that deletes its sessions. */
   async disableRoutine(routineId: string): Promise<void> {
-    await this.call("POST", `/v1/code/triggers/${routineId}`, {
-      enabled: false,
-    })
+    await this.call(
+      "POST",
+      `/v1/code/triggers/${routineId}`,
+      { enabled: false },
+      { beta: TRIGGERS_BETA },
+    )
   }
 
   /** A POST whose failure may mean it was taken all the same. */
@@ -413,7 +420,10 @@ export class SessionsApi {
     body: unknown,
   ): Promise<{ status: number; data: unknown }> {
     try {
-      return await this.call("POST", path, body, { kind: "create" })
+      return await this.call("POST", path, body, {
+        kind: "create",
+        beta: TRIGGERS_BETA,
+      })
     } catch (error) {
       if (
         error instanceof ApiError ||
