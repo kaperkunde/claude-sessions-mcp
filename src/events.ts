@@ -301,7 +301,11 @@ export type PermissionView = {
 export const MAX_SHOWN_INPUT_CHARS = 4000
 
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_:.-]{0,127}$/
-const REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/
+/**
+ * A request id as the API gives them: printable ASCII, no spaces or control
+ * characters (it is only sent back as a JSON string and used as a map key).
+ */
+const REQUEST_ID = /^[\x21-\x7e]{1,256}$/
 /** Format characters (bidi, zero-width): text that shows otherwise than it is. */
 const FORMAT = /\p{Cf}/u
 
@@ -310,12 +314,23 @@ function shown(value: unknown, max: number): string | null {
   return redact(clean(value.trim(), max))
 }
 
-export function pendingAction(
+/** The prompts a record carries: `pending_action`, then `pending_actions`. */
+function pendingCandidates(
   session: Record<string, unknown>,
+): Record<string, unknown>[] {
+  const metadata = obj(session.external_metadata)
+  const single = obj(metadata?.pending_action)
+  const many = Array.isArray(metadata?.pending_actions)
+    ? metadata.pending_actions
+        .map(obj)
+        .filter((o): o is Record<string, unknown> => o !== undefined)
+    : []
+  return single ? [single, ...many] : many
+}
+
+function usableAction(
+  pending: Record<string, unknown>,
 ): PendingAction | undefined {
-  if (session.worker_status !== "requires_action") return undefined
-  const pending = obj(obj(session.external_metadata)?.pending_action)
-  if (!pending) return undefined
   const requestId = pending.request_id
   if (typeof requestId !== "string" || !REQUEST_ID.test(requestId))
     return undefined
@@ -336,6 +351,34 @@ export function pendingAction(
         : undefined,
     description: shown(pending.action_description, 300),
     input: obj(pending.input),
+  }
+}
+
+export function pendingAction(
+  session: Record<string, unknown>,
+): PendingAction | undefined {
+  if (session.worker_status !== "requires_action") return undefined
+  for (const candidate of pendingCandidates(session)) {
+    const action = usableAction(candidate)
+    if (action) return action
+  }
+  return undefined
+}
+
+/**
+ * The key names (never values) of a record that waits on the owner but
+ * whose prompt cannot be read, for a log line that says what shape it has.
+ */
+export function unreadablePromptShape(
+  session: Record<string, unknown>,
+): { metadata: string; action: string } | undefined {
+  if (session.worker_status !== "requires_action") return undefined
+  if (pendingAction(session)) return undefined
+  const names = (o: Record<string, unknown> | undefined) =>
+    o ? Object.keys(o).sort().join(",").slice(0, 400) : ""
+  return {
+    metadata: names(obj(session.external_metadata)),
+    action: names(pendingCandidates(session)[0]),
   }
 }
 

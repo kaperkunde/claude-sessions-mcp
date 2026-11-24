@@ -70,7 +70,7 @@ export const REQUEST_DEADLINE_MS = 45_000
 const QUERY = "(?:\\?[A-Za-z0-9\\-_.~=&%]*)?"
 const PATHS: Record<HostKey, RegExp> = {
   api: new RegExp(
-    `^/v1/(?:code/sessions(?:/[A-Za-z0-9_-]{1,128}(?:/(?:events|archive|unarchive))?)?|environment_providers)${QUERY}$`,
+    `^/v1/(?:code/sessions(?:/[A-Za-z0-9_-]{1,128}(?:/(?:events|archive|unarchive))?)?|code/triggers(?:/[A-Za-z0-9_-]{1,128}(?:/run)?)?|mcp_servers|environment_providers)${QUERY}$`,
   ),
   auth: /^\/v1\/oauth\/token$/,
 }

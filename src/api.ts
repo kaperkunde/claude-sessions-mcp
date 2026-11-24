@@ -15,6 +15,8 @@ import { redact } from "./log.ts"
 
 export const API_VERSION = "2023-06-01"
 export const API_BETA = "ccr-byoc-2025-07-29"
+/** The beta of the connectors list (`GET /v1/mcp_servers`). */
+export const MCP_SERVERS_BETA = "mcp-servers-2025-12-04"
 
 export type ApiEvent = Record<string, unknown>
 
@@ -133,6 +135,7 @@ export class SessionsApi {
     options: {
       timeoutMs?: number
       accept?: number[]
+      beta?: string
       kind?: "session" | "events" | "create"
     } = {},
   ): Promise<{ status: number; data: unknown }> {
@@ -143,7 +146,7 @@ export class SessionsApi {
       const headers: Record<string, string> = {
         Authorization: `Bearer ${accessToken}`,
         "anthropic-version": API_VERSION,
-        "anthropic-beta": API_BETA,
+        "anthropic-beta": options.beta ?? API_BETA,
         "x-organization-uuid": organizationUuid,
         Accept: "application/json",
       }
@@ -265,44 +268,70 @@ export class SessionsApi {
   }
 
   /**
-   * Starts a session on a GitHub repository, as the CLI's interactive
-   * --cloud does (Claude Code 2.1.327 to 2.1.330): POST /v1/code/sessions
-   * with the title, the environment, the task as the one first event
-   * ({payload: <a user message>}, in the create body: the CLI posts no
-   * later event) and the config: the repository and the branch to start
-   * from as the source, the repository and the branch the session works on
-   * as the outcome. The answer is {session: {id, title, …}}.
+   * The account's claude.ai connectors (`GET /v1/mcp_servers`, its own
+   * beta), as a routine names them: id, name and address. Rows that are
+   * only an additional install, or not eligible, are left out. Pages are
+   * followed a few times (`next_page`).
    */
-  async createSession(input: {
+  async connectors(): Promise<
+    { id: string; displayName: string; url: string }[]
+  > {
+    const found: { id: string; displayName: string; url: string }[] = []
+    let page: string | undefined
+    for (let n = 0; n < 5; n++) {
+      const { data } = await this.call(
+        "GET",
+        `/v1/mcp_servers?limit=1000${page !== undefined ? `&page=${page}` : ""}`,
+        undefined,
+        { beta: MCP_SERVERS_BETA },
+      )
+      for (const row of objects((data as { data?: unknown }).data)) {
+        if (row.additional_install === true || row.eligible === false) continue
+        const { id, url } = row
+        const name = row.display_name ?? row.name
+        if (
+          typeof id !== "string" ||
+          !id ||
+          typeof url !== "string" ||
+          !url ||
+          typeof name !== "string"
+        )
+          continue
+        found.push({
+          id: id.slice(0, 200),
+          displayName: name.trim().slice(0, 120) || "connector",
+          url: url.slice(0, 2000),
+        })
+      }
+      const next = (data as { next_page?: unknown }).next_page
+      if (typeof next !== "string" || !CURSOR.test(next)) break
+      page = next
+    }
+    return found
+  }
+
+  /**
+   * Makes a routine (the API's trigger) that starts a session with the
+   * task as its first message, as claude.ai's own routines do. It has no
+   * schedule, so it only ever runs when it is run. `connections` name the
+   * connectors it attaches; none lets the server attach the account's.
+   */
+  async createRoutine(input: {
     repo: string
     branch: string
     task: string
     environmentId: string
-  }): Promise<{ id: string; title: string | null }> {
+    connections?: { connector_uuid: string; name: string; url: string }[]
+  }): Promise<string> {
     const title = input.task.replace(/\s+/g, " ").trim().slice(0, 75)
-    let data: unknown
-    try {
-      ;({ data } = await this.call(
-        "POST",
-        "/v1/code/sessions",
-        {
-          title,
-          // As the CLI names it: a self-hosted pool is another field.
+    const { data } = await this.createCall("/v1/code/triggers", {
+      name: title,
+      job_config: {
+        ccr: {
           ...(input.environmentId.startsWith("ccpool_")
             ? { self_hosted_runner_pool_id: input.environmentId }
             : { environment_id: input.environmentId }),
-          events: [
-            {
-              payload: {
-                uuid: randomUUID(),
-                session_id: "",
-                type: "user",
-                parent_tool_use_id: null,
-                message: { role: "user", content: input.task },
-              },
-            },
-          ],
-          config: {
+          session_context: {
             sources: [
               {
                 type: "git_repository",
@@ -316,15 +345,75 @@ export class SessionsApi {
                 git_info: {
                   type: "github",
                   repo: input.repo,
-                  // The CLI's own fallback name when it has none made.
                   branches: [`claude/task-${randomBytes(3).toString("hex")}`],
                 },
               },
             ],
           },
+          events: [
+            {
+              data: {
+                uuid: randomUUID(),
+                session_id: "",
+                type: "user",
+                parent_tool_use_id: null,
+                message: { role: "user", content: input.task },
+              },
+            },
+          ],
         },
-        { kind: "create" },
-      ))
+      },
+      ...(input.connections?.length
+        ? { mcp_connections: input.connections }
+        : {}),
+    })
+    const record = data as { id?: unknown; trigger?: { id?: unknown } }
+    const id = record.trigger?.id ?? record.id
+    if (typeof id !== "string" || !ROUTINE_ID.test(id))
+      throw new ApiError(
+        200,
+        "The sessions API answered with no usable routine id. Nothing was started.",
+      )
+    return id
+  }
+
+  /**
+   * Runs a routine into a fresh session: the session's id when the answer
+   * names one, else null (see routineSessions).
+   */
+  async runRoutine(routineId: string): Promise<string | null> {
+    const { data } = await this.createCall(
+      `/v1/code/triggers/${routineId}/run`,
+      {},
+    )
+    return sessionIdIn(data)
+  }
+
+  /** The ids of the sessions a routine started, as the sessions list gives them. */
+  async routineSessions(routineId: string): Promise<string[]> {
+    const { data } = await this.call(
+      "GET",
+      `/v1/code/sessions?trigger_id=${routineId}&limit=5`,
+    )
+    return objects((data as { data?: unknown }).data)
+      .map((r) => sessionIdIn(r))
+      .filter((id): id is string => id !== null)
+  }
+
+  /** Turns a routine off, so it shows as done. It is never deleted: that deletes its sessions. */
+  async disableRoutine(routineId: string): Promise<void> {
+    await this.call("POST", `/v1/code/triggers/${routineId}`, {
+      enabled: false,
+    })
+  }
+
+  /** A POST whose failure may mean it was taken all the same. */
+  private async createCall(
+    path: string,
+    body: unknown,
+  ): Promise<{ status: number; data: unknown }> {
+    try {
+      return await this.call("POST", path, body, { kind: "create" })
     } catch (error) {
       if (
         error instanceof ApiError ||
@@ -332,27 +421,10 @@ export class SessionsApi {
         error instanceof RenewalError
       )
         throw error
-      // The request may have been received: say so, so it is not repeated.
       throw new ApiError(
         0,
         "The sessions API gave no answer, so a session may have started all the same: check list_sessions before trying again, so it is not started twice.",
       )
-    }
-    const session = (data as { session?: unknown }).session
-    const id =
-      session && typeof session === "object"
-        ? (session as { id?: unknown }).id
-        : undefined
-    if (typeof id !== "string" || !SESSION_ID.test(id)) {
-      throw new ApiError(
-        200,
-        "The sessions API answered with no usable session id, so a session may have started all the same: check list_sessions before trying again.",
-      )
-    }
-    const named = (session as { title?: unknown }).title
-    return {
-      id,
-      title: typeof named === "string" ? redact(named).slice(0, 200) : null,
     }
   }
 
@@ -408,6 +480,27 @@ export class SessionsApi {
     )
     return objects((data as { environments?: unknown }).environments)
   }
+}
+
+/** A routine's id as the API names them (trig_…). */
+export const ROUTINE_ID = /^[A-Za-z0-9_-]{3,128}$/
+
+/**
+ * A session's id in a record or an answer, found defensively: `id`,
+ * `session_id`, or a nested `session`.
+ */
+export function sessionIdIn(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  for (const candidate of [
+    record.session_id,
+    record.id,
+    (record.session as { id?: unknown } | undefined)?.id,
+    (record.response_shape as { id?: unknown } | undefined)?.id,
+  ])
+    if (typeof candidate === "string" && SESSION_ID.test(candidate))
+      return candidate
+  return null
 }
 
 /** A cursor as the API hands them out, safe to send back in a query. */

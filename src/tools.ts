@@ -22,6 +22,7 @@ import {
   MAX_ANSWER_TOTAL_CHARS,
   payloadOf,
   pendingAction,
+  unreadablePromptShape,
   permissionView,
   questionAnswers,
   QUESTION_KINDS,
@@ -248,6 +249,46 @@ const STATE = z
     "working: a turn is under way. waiting: its last turn ended and it waits for a message. needs_permission: it waits on a permission prompt (pending_permission), or on a prompt that cannot be read here (both pending fields null: answer it on claude.ai/code). needs_answer: it waits on the owner's answer to its questions (pending_question). stalled: its worker is running but lost contact with the cloud environment, so nothing moves until it comes back. done: archived. unknown: none of these can be told.",
   )
 
+/** How long start_session looks for the routine's session, and how often. */
+const FIND_SESSION_MS = 20_000
+const FIND_SESSION_POLL_MS = 2_000
+
+/**
+ * The environment to start in when none is named: the one the account marks
+ * default (`is_default` or `default`), else one named exactly "Default",
+ * else the first Anthropic cloud one.
+ */
+export function defaultEnvironment(
+  raw: Record<string, unknown>[],
+): string | undefined {
+  const cloud = raw
+    .map((r) => ({ raw: r, view: environmentView(r) }))
+    .filter((e) => e.view.kind === "anthropic_cloud" && e.view.id)
+  return (
+    cloud.find((e) => e.raw.is_default === true || e.raw.default === true) ??
+    cloud.find((e) => e.view.name === "Default") ??
+    cloud[0]
+  )?.view.id
+}
+
+/** A connector's name as a routine takes it: letters, digits, _ and -. */
+export function connectorName(display: string): string {
+  return (
+    display
+      .trim()
+      .replace(/[\s.]+/g, "_")
+      .replace(/[^A-Za-z0-9_-]/g, "")
+      .slice(0, 60) || "connector"
+  )
+}
+
+function uniqueName(name: string, taken: Set<string>): string {
+  let candidate = name
+  for (let n = 2; taken.has(candidate); n++) candidate = `${name}_${n}`
+  taken.add(candidate)
+  return candidate
+}
+
 /** An environment as list_environments shows it. */
 export function environmentView(raw: Record<string, unknown>) {
   const kind = str(raw.kind, 40) ?? "unknown"
@@ -326,6 +367,7 @@ export const MAX_ANSWERED = 1000
 export function toolSpecs(deps: ToolDeps): ToolSpec[] {
   const { api, cli, credentials } = deps
   const answered = deps.answered ?? new Set<string>()
+  const unreadable = new Set<string>()
   const now = deps.now ?? Date.now
   const sleep =
     deps.sleep ??
@@ -338,7 +380,21 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
    */
   async function prompt(id: string, session: Record<string, unknown>) {
     const action: PendingAction | undefined = pendingAction(session)
-    if (!action) return { pending_permission: null, pending_question: null }
+    if (!action) {
+      // Waiting on the owner with a prompt that cannot be read: say once per
+      // session what shape the record has (key names only, never values).
+      const shape = unreadablePromptShape(session)
+      if (shape && !unreadable.has(id)) {
+        if (unreadable.size >= 1000) unreadable.clear()
+        unreadable.add(id)
+        deps.logger.warn("unreadable_pending_action", {
+          session: id,
+          metadata_keys: shape.metadata,
+          action_keys: shape.action,
+        })
+      }
+      return { pending_permission: null, pending_question: null }
+    }
     const input = action.input ?? (await requestInput(id, action.requestId))
     return isQuestion(action)
       ? {
@@ -774,7 +830,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     name: "start_session",
     title: "Start a Claude Code cloud session",
     description:
-      "Start a new Claude Code cloud session on a GitHub repository with a task as its first message, in the account's first Anthropic cloud environment or the one environment_id names (list_environments). It starts working at once, on the owner's plan. Start only what the owner asked for; check list_sessions before trying again after a failure.",
+      "Start a new Claude Code cloud session on a GitHub repository with a task as its first message, with the owner's claude.ai connectors (PCP and the like) attached, in the account's default Anthropic cloud environment (the one marked default, else the one named Default, else the first) or the one environment_id names (list_environments). It is started through a one-off routine, so the answer names it too. It starts working at once, on the owner's plan. Start only what the owner asked for; check list_sessions before trying again after a failure.",
     input: z.strictObject({
       repo: z
         .string()
@@ -799,13 +855,33 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
         .max(128)
         .optional()
         .describe(
-          "The cloud environment to run in, an id from list_environments. Left out: the account's first Anthropic cloud one (kind anthropic_cloud).",
+          "The cloud environment to run in, an id from list_environments. Left out: the account's default Anthropic cloud one (marked default, else named Default, else the first of kind anthropic_cloud).",
         ),
     }),
     output: z.object({
-      session_id: z.string().describe("The new session's id."),
+      session_id: z
+        .string()
+        .nullable()
+        .describe(
+          "The new session's id; null when it was not seen yet (it appears in list_sessions within a minute).",
+        ),
       url: z.string().nullable().describe("Its claude.ai/code address."),
       title: z.string().nullable().describe("Its title."),
+      environment_id: z.string().describe("The environment it runs in."),
+      routine_id: z
+        .string()
+        .describe(
+          "The one-off routine that started it. Never delete it: that deletes the session.",
+        ),
+      connectors: z
+        .array(z.string())
+        .describe(
+          "The connectors attached, by display name. Empty: it will not have PCP or other connectors.",
+        ),
+      note: z
+        .string()
+        .nullable()
+        .describe("What to know about how it started, if anything."),
     }),
     annotations: WRITE,
     async run(args) {
@@ -815,37 +891,108 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       if (requested !== undefined && !ENVIRONMENT_ID.test(requested))
         throw new ToolRefusal("environment_id is an id from list_environments.")
       // Every check is made before the one request that starts anything.
-      const known = (await api.allEnvironments()).map(environmentView)
+      const all = await api.allEnvironments()
       let environmentId: string
       if (requested !== undefined) {
-        if (!known.some((e) => e.id === requested))
+        if (!all.map(environmentView).some((e) => e.id === requested))
           throw new ToolRefusal(
             `No environment ${requested}: use an id from list_environments.`,
           )
         environmentId = requested
       } else {
-        const first = known.find((e) => e.kind === "anthropic_cloud" && e.id)
-        if (!first)
+        const chosen = defaultEnvironment(all)
+        if (!chosen)
           throw new ToolRefusal(
             "The account has no cloud environment to start a session in: set one up on claude.ai/code, or name one with environment_id (list_environments).",
           )
-        environmentId = first.id
+        environmentId = chosen
       }
-      const created = await api.createSession({
+      // The account's connectors, named so the routine attaches them. A
+      // failure here is not a failure to start: the server then attaches
+      // the account's own, and the answer says they could not be named.
+      let named: { id: string; displayName: string; url: string }[] = []
+      let listFailed = false
+      try {
+        named = await api.connectors()
+      } catch (error) {
+        if (error instanceof SignedOut || error instanceof RenewalError)
+          throw error
+        listFailed = true
+        deps.logger.warn("connectors_unlisted", {
+          status: error instanceof ApiError ? error.status : undefined,
+        })
+      }
+      const taken = new Set<string>()
+      const connections = named.map((c) => ({
+        connector_uuid: c.id,
+        name: uniqueName(connectorName(c.displayName), taken),
+        url: c.url,
+      }))
+      const routineId = await api.createRoutine({
         repo: args.repo as string,
         branch: args.branch as string,
         task,
         environmentId,
+        connections,
       })
-      const started = {
-        sessionId: created.id,
-        url: SESSION_URL(created.id) ?? undefined,
-        title: created.title ?? undefined,
+      let sessionId: string | null
+      try {
+        sessionId = await api.runRoutine(routineId)
+      } catch (error) {
+        const mayHaveStarted =
+          error instanceof ApiError &&
+          (error.status === 0 || error.status >= 500 || error.status === 408)
+        // A refusal started nothing; the routine stays, poke-only and off.
+        if (error instanceof ApiError)
+          throw new ApiError(
+            error.status,
+            mayHaveStarted
+              ? `${error.message} (Its routine is ${routineId}.)`
+              : `${error.message} The routine ${routineId} was made but did not run, so no session started.`,
+          )
+        throw error
       }
+      // The run's answer may not name the session: look among the routine's.
+      const deadline = now() + FIND_SESSION_MS
+      for (let tries = 0; sessionId === null; tries++) {
+        if (tries > 0) await sleep(FIND_SESSION_POLL_MS)
+        try {
+          sessionId = (await api.routineSessions(routineId))[0] ?? null
+        } catch (error) {
+          if (error instanceof SignedOut || error instanceof RenewalError)
+            throw error
+        }
+        if (sessionId !== null || now() >= deadline) break
+      }
+      // Done: shown as such. Never deleted, which would delete the session.
+      try {
+        await api.disableRoutine(routineId)
+      } catch (error) {
+        deps.logger.warn("routine_not_disabled", {
+          status: error instanceof ApiError ? error.status : undefined,
+        })
+      }
+      const notes: string[] = []
+      if (listFailed)
+        notes.push(
+          "The account's connectors could not be listed, so none were named: the server attaches the account's connected connectors itself, if it does.",
+        )
+      else if (connections.length === 0)
+        notes.push(
+          "The session will not have PCP or other connectors: the account lists none it can attach.",
+        )
+      if (sessionId === null)
+        notes.push(
+          `The session was not seen yet: it appears in list_sessions within a minute (routine ${routineId}).`,
+        )
       return {
-        session_id: started.sessionId,
-        url: started.url ?? null,
-        title: started.title ?? null,
+        session_id: sessionId,
+        url: sessionId ? (SESSION_URL(sessionId) ?? null) : null,
+        title: task.replace(/\s+/g, " ").slice(0, 75),
+        environment_id: environmentId,
+        routine_id: routineId,
+        connectors: named.map((c) => c.displayName),
+        note: notes.length ? notes.join(" ") : null,
       }
     },
   }
@@ -939,7 +1086,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       request_id: z
         .string()
         .min(1)
-        .max(128)
+        .max(256)
         .describe("pending_permission.request_id, as it was shown."),
       decision: z
         .enum(["allow", "deny"])
@@ -1035,7 +1182,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       request_id: z
         .string()
         .min(1)
-        .max(128)
+        .max(256)
         .describe("pending_question.request_id, as it was shown."),
       answers: z
         .array(
