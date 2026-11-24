@@ -289,18 +289,18 @@ export class SessionsApi {
       )
       for (const row of objects((data as { data?: unknown }).data)) {
         if (row.additional_install === true || row.eligible === false) continue
-        const { id, url } = row
+        const { url } = row
+        const id = connectorUuid(row.id)
         const name = row.display_name ?? row.name
         if (
-          typeof id !== "string" ||
-          !id ||
+          id === null ||
           typeof url !== "string" ||
           !url ||
           typeof name !== "string"
         )
           continue
         found.push({
-          id: id.slice(0, 200),
+          id,
           displayName: name.trim().slice(0, 120) || "connector",
           url: url.slice(0, 2000),
         })
@@ -490,6 +490,34 @@ export class SessionsApi {
     )
     return objects((data as { environments?: unknown }).environments)
   }
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+/**
+ * A connector's UUID, as a routine's mcp_connections takes it, from the id
+ * the connectors list gives (mcpsrv_ and two version characters, then the
+ * UUID's 128 bits in base58; an older mcprs prefix reads the same), as the
+ * CLI works it out. A UUID is taken as it is. Anything else is null.
+ */
+export function connectorUuid(id: unknown): string | null {
+  if (typeof id !== "string" || id.length > 64) return null
+  const lower = id.toLowerCase()
+  if (UUID.test(lower)) return lower
+  const named = id.startsWith("mcprs") ? `mcpsrv${id.slice(5)}` : id
+  if (!named.startsWith("mcpsrv_")) return null
+  const digits = named.slice(7).slice(2)
+  if (!digits) return null
+  let value = 0n
+  for (const char of digits) {
+    const n = BASE58.indexOf(char)
+    if (n === -1) return null
+    value = value * 58n + BigInt(n)
+  }
+  if (value >= 1n << 128n) return null
+  const hex = value.toString(16).padStart(32, "0")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 /** A routine's id as the API names them (trig_…). */

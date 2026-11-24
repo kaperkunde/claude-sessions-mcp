@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- a body read as untrusted JSON, checked by hand */
 import { describe, expect, it } from "vitest"
 
+import { connectorUuid } from "../src/api.ts"
 import { REFRESH_MARGIN_MS } from "../src/credentials.ts"
 import { EgressError } from "../src/egress.ts"
 import { defaultEnvironment } from "../src/tools.ts"
@@ -98,43 +99,71 @@ describe("start_session", () => {
   it("attaches the connectors with sanitized, unique names, across pages, skipping the ones it cannot", async () => {
     const s = setup()
     s.fake.connectors = [
-      { id: "m1", display_name: "My PCP v1.2", url: "https://a.example/mcp" },
-      { id: "m2", display_name: "My.PCP v1_2", url: "https://b.example/mcp" },
-      { id: "m3", display_name: "Gmail (work)", url: "https://c.example/mcp" },
-      { id: "m4", display_name: "日本語", url: "https://d.example/mcp" },
       {
-        id: "m5",
+        id: "mcpsrv_014Fj7srWvLMyCuRCS8J9W3d",
+        display_name: "My PCP v1.2",
+        url: "https://a.example/mcp",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000002",
+        display_name: "My.PCP v1_2",
+        url: "https://b.example/mcp",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000003",
+        display_name: "Gmail (work)",
+        url: "https://c.example/mcp",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000004",
+        display_name: "日本語",
+        url: "https://d.example/mcp",
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000005",
         display_name: "Extra",
         url: "https://e.example/mcp",
         additional_install: true,
       },
       {
-        id: "m6",
+        id: "00000000-0000-4000-8000-000000000006",
         display_name: "Nope",
         url: "https://f.example/mcp",
         eligible: false,
       },
-      { id: "m7", display_name: "Last", url: "https://g.example/mcp" },
+      {
+        id: "00000000-0000-4000-8000-000000000007",
+        display_name: "Last",
+        url: "https://g.example/mcp",
+      },
     ]
     const answer = await s.ok("start_session", START)
     expect(routine(s).mcp_connections).toEqual([
       {
-        connector_uuid: "m1",
+        connector_uuid: "1a59c906-04da-521d-bda7-7f71b9f9e01c",
         name: "My_PCP_v1_2",
         url: "https://a.example/mcp",
       },
       {
-        connector_uuid: "m2",
+        connector_uuid: "00000000-0000-4000-8000-000000000002",
         name: "My_PCP_v1_2_2",
         url: "https://b.example/mcp",
       },
       {
-        connector_uuid: "m3",
+        connector_uuid: "00000000-0000-4000-8000-000000000003",
         name: "Gmail_work",
         url: "https://c.example/mcp",
       },
-      { connector_uuid: "m4", name: "connector", url: "https://d.example/mcp" },
-      { connector_uuid: "m7", name: "Last", url: "https://g.example/mcp" },
+      {
+        connector_uuid: "00000000-0000-4000-8000-000000000004",
+        name: "connector",
+        url: "https://d.example/mcp",
+      },
+      {
+        connector_uuid: "00000000-0000-4000-8000-000000000007",
+        name: "Last",
+        url: "https://g.example/mcp",
+      },
     ])
     expect(answer.connectors).toEqual([
       "My PCP v1.2",
@@ -454,5 +483,30 @@ describe("start_session", () => {
     expect(errorText(await s.call("start_session", START))).toMatch(
       /no usable routine id/i,
     )
+  })
+})
+
+describe("connectorUuid", () => {
+  it("decodes a connector id from the connectors list into its UUID, as the CLI does", () => {
+    expect(connectorUuid("mcpsrv_014Fj7srWvLMyCuRCS8J9W3d")).toBe(
+      "1a59c906-04da-521d-bda7-7f71b9f9e01c",
+    )
+    expect(connectorUuid("mcprs_014Fj7srWvLMyCuRCS8J9W3d")).toBe(
+      "1a59c906-04da-521d-bda7-7f71b9f9e01c",
+    )
+  })
+
+  it("takes a UUID as it is, in lower case", () => {
+    expect(connectorUuid("1A59C906-04DA-521D-BDA7-7F71B9F9E01C")).toBe(
+      "1a59c906-04da-521d-bda7-7f71b9f9e01c",
+    )
+  })
+
+  it("refuses anything else", () => {
+    expect(connectorUuid("mcp_01Pcp")).toBeNull()
+    expect(connectorUuid("mcpsrv_01")).toBeNull()
+    expect(connectorUuid("mcpsrv_01I0O0l")).toBeNull()
+    expect(connectorUuid(`mcpsrv_01${"z".repeat(40)}`)).toBeNull()
+    expect(connectorUuid(42)).toBeNull()
   })
 })

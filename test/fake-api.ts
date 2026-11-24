@@ -98,7 +98,11 @@ export class FakeAnthropic {
   ]
   /** The account's connectors, as GET /v1/mcp_servers rows. */
   connectors: Record<string, unknown>[] = [
-    { id: "mcp_01Pcp", display_name: "PCP", url: "https://pcp.example/mcp" },
+    {
+      id: "mcpsrv_014Fj7srWvLMyCuRCS8J9W3d",
+      display_name: "PCP",
+      url: "https://pcp.example/mcp",
+    },
   ]
   /** Listing the connectors answers this status instead. */
   connectorsFailure: number | undefined
@@ -458,6 +462,10 @@ export class FakeAnthropic {
         if (
           !/^[A-Za-z0-9_-]+$/.test(c.name) ||
           typeof c.connector_uuid !== "string" ||
+          // As the live API: a connector_uuid that is not a UUID is refused.
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+            c.connector_uuid,
+          ) ||
           typeof c.url !== "string"
         )
           return error(400, "mcp_connections")
