@@ -2,7 +2,7 @@
 import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 
-import { API_BETA, API_VERSION } from "../src/api.ts"
+import { API_BETA, API_VERSION, MCP_SERVERS_BETA } from "../src/api.ts"
 import { CLIENT_ID } from "../src/credentials.ts"
 import type {
   IncomingResponse,
@@ -77,9 +77,7 @@ export class FakeAnthropic {
   /** A renewal answers 200 with this body instead of the tokens. */
   renewalBody: string | undefined
   sessions = new Map<string, FakeSession>()
-  /** Every body POSTed to /v1/code/sessions that was accepted. */
-  created: Record<string, unknown>[] = []
-  /** Creating a session answers this status and message instead. */
+  /** Creating a routine answers this status and message instead. */
   createFailure: { status: number; message: string } | undefined
   environments: Record<string, unknown>[] = [
     {
@@ -93,6 +91,25 @@ export class FakeAnthropic {
       name: "Node, more memory",
     },
   ]
+  /** The account's connectors, as GET /v1/mcp_servers rows. */
+  connectors: Record<string, unknown>[] = [
+    { id: "mcp_01Pcp", display_name: "PCP", url: "https://pcp.example/mcp" },
+  ]
+  /** Listing the connectors answers this status instead. */
+  connectorsFailure: number | undefined
+  /** Every body POSTed to /v1/code/triggers that was accepted. */
+  routines: Record<string, any>[] = []
+  /** Running a routine names the session in its answer. */
+  runNamesSession = true
+  /** Running a routine answers this status instead (the session still starts). */
+  runFailure: number | undefined
+  /** Updating a routine answers this status. */
+  updateFailure: number | undefined
+  /** Updates a routine received: [id, body]. */
+  routineUpdates: [string, unknown][] = []
+  /** Polls of the routine's sessions before the session shows. */
+  runLagPolls = 0
+  private routineRuns = new Map<string, { id: string; polls: number }>()
   private seq = 1000
   private readonly now: () => number
 
@@ -202,10 +219,26 @@ export class FakeAnthropic {
     )
       return error(401, "OAuth token has expired")
     if (h["anthropic-version"] !== API_VERSION) return error(400, "version")
-    if (h["anthropic-beta"] !== API_BETA) return error(400, "beta")
-    if (h["x-organization-uuid"] !== ORG) return error(403, "organization")
-
     const url = new URL(request.path, "https://api.invalid")
+    const wantBeta =
+      url.pathname === "/v1/mcp_servers" ? MCP_SERVERS_BETA : API_BETA
+    if (h["anthropic-beta"] !== wantBeta) return error(400, "beta")
+    if (h["x-organization-uuid"] !== ORG) return error(403, "organization")
+    if (url.pathname === "/v1/mcp_servers") {
+      if (request.method !== "GET") return error(405, "method")
+      if (this.connectorsFailure)
+        return error(this.connectorsFailure, "connectors")
+      const page = Number(url.searchParams.get("page") ?? "0")
+      const size = 2
+      const rows = this.connectors.slice(page * size, page * size + size)
+      return json(200, {
+        data: rows,
+        next_page:
+          (page + 1) * size < this.connectors.length ? String(page + 1) : null,
+      })
+    }
+    if (url.pathname.startsWith("/v1/code/triggers"))
+      return this.triggers(request, url)
     if (url.pathname === "/v1/environment_providers") {
       if (request.method !== "GET") return error(405, "method")
       const limit = Number(url.searchParams.get("limit") ?? "20")
@@ -223,11 +256,16 @@ export class FakeAnthropic {
         last_id: page.length ? idOf(page.at(-1)!) : null,
       })
     }
-    if (url.pathname === "/v1/code/sessions" && request.method === "POST")
-      return this.create(request)
     const parts = url.pathname.split("/").filter(Boolean) // v1 code sessions [id] [events|archive|unarchive]
     if (parts.length === 3 && request.method === "GET") {
       if (this.forbidList) return error(403, "missing scope")
+      const trigger = url.searchParams.get("trigger_id")
+      if (trigger !== null) {
+        const run = this.routineRuns.get(trigger)
+        if (!run || ++run.polls <= this.runLagPolls)
+          return json(200, { data: [], has_more: false })
+        return json(200, { data: [{ id: run.id }], has_more: false })
+      }
       const limit = Number(url.searchParams.get("limit") ?? "20")
       const data = [...this.sessions.values()]
         .map((s) => s.record)
@@ -369,84 +407,84 @@ export class FakeAnthropic {
   }
 
   /**
-   * POST /v1/code/sessions as the CLI's interactive --cloud sends it
-   * (Claude Code 2.1.327-2.1.330, "v1alpha2"): { title, environment_id,
-   * events: [{ payload: <the first user message> }], config: { sources,
-   * outcomes } }, answered { session: { id, title, … } }. The first
-   * message is in the body, never a later POST to the events. Anything
-   * else in the body is refused, as a strict API would.
+   * Routines (the API's triggers), as claude.ai's own are made: POST
+   * /v1/code/triggers { name, job_config: { ccr: { environment_id,
+   * session_context, events: [{ data }] } }, mcp_connections? }, run by
+   * POST /v1/code/triggers/{id}/run and turned off by POST /{id}.
    */
-  private create(request: OutgoingRequest): IncomingResponse {
-    if (this.createFailure)
-      return error(this.createFailure.status, this.createFailure.message)
-    const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>
-    const allowed = [
-      "title",
-      "environment_id",
-      "self_hosted_runner_pool_id",
-      "events",
-      "config",
-    ]
-    for (const key of Object.keys(body))
-      if (!allowed.includes(key)) return error(400, `unknown field ${key}`)
-    const wanted = body.self_hosted_runner_pool_id ?? body.environment_id
-    if (
-      "self_hosted_runner_pool_id" in body === "environment_id" in body ||
-      (typeof wanted === "string" && wanted.startsWith("ccpool_")) !==
-        "self_hosted_runner_pool_id" in body
-    )
-      return error(400, "environment_id or self_hosted_runner_pool_id")
-    const environment = this.environments.find(
-      (e) => (e.environment_id ?? e.pool_id) === wanted,
-    )
-    if (!environment) return error(404, "environment not found")
-    if (typeof body.title !== "string" || body.title === "")
-      return error(400, "title is required")
-    const events = body.events as { payload?: Record<string, unknown> }[]
-    if (!Array.isArray(events) || events.length !== 1)
-      return error(400, "events: exactly one first event")
-    const payload = events[0]!.payload as Record<string, any> | undefined
-    if (
-      Object.keys(events[0]!).join() !== "payload" ||
-      !payload ||
-      payload.type !== "user" ||
-      payload.session_id !== "" ||
-      payload.parent_tool_use_id !== null ||
-      typeof payload.uuid !== "string" ||
-      payload.message?.role !== "user" ||
-      typeof payload.message?.content !== "string"
-    )
-      return error(400, "events[0].payload is not a user message")
-    const config = body.config as Record<string, any> | undefined
-    const source = config?.sources?.[0]
-    const outcome = config?.outcomes?.[0]
-    if (
-      !config ||
-      Object.keys(config).sort().join() !== "outcomes,sources" ||
-      config.sources.length !== 1 ||
-      source?.type !== "git_repository" ||
-      !/^https:\/\/github\.com\/[^/]+\/[^/]+$/.test(source.url) ||
-      typeof source.revision !== "string" ||
-      config.outcomes.length !== 1 ||
-      outcome?.type !== "git_repository" ||
-      outcome.git_info?.type !== "github" ||
-      `https://github.com/${outcome.git_info.repo}` !== source.url ||
-      !Array.isArray(outcome.git_info.branches) ||
-      outcome.git_info.branches.length !== 1
-    )
-      return error(400, "config.sources / config.outcomes")
-    this.created.push(body)
-    const id = `cse_new${String(this.seq++).padStart(8, "0")}`
+  private triggers(request: OutgoingRequest, url: URL): IncomingResponse {
+    const parts = url.pathname.split("/").filter(Boolean) // v1 code triggers [id] [run]
+    const body = JSON.parse(request.body ?? "{}") as Record<string, any>
+    if (parts.length === 3) {
+      if (request.method !== "POST") return error(405, "method")
+      if (this.createFailure)
+        return error(this.createFailure.status, this.createFailure.message)
+      for (const key of Object.keys(body))
+        if (!["name", "job_config", "mcp_connections"].includes(key))
+          return error(400, `unknown field ${key}`)
+      const ccr = body.job_config?.ccr as Record<string, any> | undefined
+      const event = ccr?.events?.[0]?.data
+      const wanted = ccr?.self_hosted_runner_pool_id ?? ccr?.environment_id
+      if (
+        typeof body.name !== "string" ||
+        !ccr ||
+        "cron_expression" in body ||
+        "run_once_at" in body ||
+        !this.environments.some(
+          (e) => (e.environment_id ?? e.pool_id) === wanted,
+        ) ||
+        !Array.isArray(ccr.session_context?.sources) ||
+        !Array.isArray(ccr.session_context?.outcomes) ||
+        Object.keys(ccr.events?.[0] ?? {}).join() !== "data" ||
+        event?.type !== "user" ||
+        event.session_id !== "" ||
+        event.parent_tool_use_id !== null ||
+        typeof event.message?.content !== "string"
+      )
+        return error(400, "job_config.ccr is not a routine")
+      for (const c of body.mcp_connections ?? [])
+        if (
+          !/^[A-Za-z0-9_-]+$/.test(c.name) ||
+          typeof c.connector_uuid !== "string" ||
+          typeof c.url !== "string"
+        )
+          return error(400, "mcp_connections")
+      const id = `trig_${String(this.seq++).padStart(6, "0")}`
+      this.routines.push({ ...body, id })
+      return json(200, { id, name: body.name, enabled: true })
+    }
+    const id = parts[3]!
+    const routine = this.routines.find((r) => r.id === id)
+    if (!routine) return error(404, "routine not found")
+    if (parts[4] === "run" && request.method === "POST") {
+      if (this.runFailure && this.runFailure >= 500) {
+        this.startRoutineSession(routine)
+        return error(this.runFailure, "upstream")
+      }
+      if (this.runFailure) return error(this.runFailure, "refused")
+      const sessionId = this.startRoutineSession(routine)
+      return json(200, this.runNamesSession ? { session_id: sessionId } : {})
+    }
+    if (parts.length === 4 && request.method === "POST") {
+      this.routineUpdates.push([id, body])
+      if (this.updateFailure) return error(this.updateFailure, "update")
+      return json(200, { id, enabled: body.enabled })
+    }
+    return error(404, "not found")
+  }
+
+  private startRoutineSession(routine: Record<string, any>): string {
+    const ccr = routine.job_config.ccr
+    const id = `cse_run${String(this.seq++).padStart(8, "0")}`
+    const event = ccr.events[0].data
     this.addSession(id, {
-      title: body.title,
-      environment_id: wanted,
-      environment_kind: environment.kind,
-      config: { sources: [source] },
+      title: routine.name,
+      environment_id: ccr.environment_id ?? ccr.self_hosted_runner_pool_id,
+      config: { sources: ccr.session_context.sources },
     })
-    this.addEvent(id, payload)
-    return json(200, {
-      session: { id, title: body.title, status: "active" },
-    })
+    this.addEvent(id, event)
+    this.routineRuns.set(routine.id, { id, polls: 0 })
+    return id
   }
 
   /** Puts a permission prompt on a session, as a worker waiting on one. */
