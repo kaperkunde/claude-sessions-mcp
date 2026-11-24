@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- answers read as untrusted JSON */
 import { describe, expect, it } from "vitest"
 
-import { stateOf } from "../src/events.ts"
+import { pendingAction, stateOf } from "../src/events.ts"
 import { errorText, setup } from "./helpers.ts"
 
 /**
@@ -834,5 +835,81 @@ describe("answer_question", () => {
     ).toMatch(/answer_permission/)
     expect(s.fake.posted).toHaveLength(0)
     expect(p.fake.posted).toHaveLength(0)
+  })
+})
+
+describe("a question the record carries in other shapes", () => {
+  const input = { questions: [COLOUR] }
+
+  it("reads one that is only in pending_actions", async () => {
+    const s = setup()
+    s.fake.addSession(ID, {
+      worker_status: "requires_action",
+      external_metadata: {
+        pending_actions: [
+          { request_id: "bad id", tool_name: "AskUserQuestion" },
+          { request_id: "req_q_2", tool_name: "AskUserQuestion", input },
+        ],
+      },
+    })
+    const { session } = (await s.ok("get_session", { session_id: ID })) as any
+    expect(session.pending_permission).toBeNull()
+    expect(session.pending_question).toMatchObject({ request_id: "req_q_2" })
+    expect(
+      stateOf([], {
+        worker_status: "requires_action",
+        external_metadata: {
+          pending_actions: [{ request_id: "r", tool_name: "AskUserQuestion" }],
+        },
+      }),
+    ).toBe("needs_answer")
+  })
+
+  it("prefers pending_action, and takes request ids with . and :", () => {
+    const record = {
+      worker_status: "requires_action",
+      external_metadata: {
+        pending_action: { request_id: "toolu_01.abc:7", tool_name: "Bash" },
+        pending_actions: [
+          { request_id: "other", tool_name: "AskUserQuestion" },
+        ],
+      },
+    }
+    expect(pendingAction(record)?.requestId).toBe("toolu_01.abc:7")
+    for (const bad of ["", "a b", "a\nb", "é", "x".repeat(257)])
+      expect(
+        pendingAction({
+          worker_status: "requires_action",
+          external_metadata: { pending_action: { request_id: bad } },
+        }),
+      ).toBeUndefined()
+    expect(
+      pendingAction({
+        worker_status: "requires_action",
+        external_metadata: {
+          pending_action: { request_id: "x".repeat(256) },
+        },
+      }),
+    ).toBeDefined()
+  })
+
+  it("logs the key names, once per session, when no prompt can be read", async () => {
+    const s = setup()
+    s.fake.addSession(ID, {
+      worker_status: "requires_action",
+      external_metadata: {
+        pending_actions: [{ requestid: "SECRET-VALUE", tool_name: "X" }],
+        other: "SECRET-VALUE",
+      },
+    })
+    await s.ok("get_session", { session_id: ID })
+    await s.ok("get_session", { session_id: ID })
+    const logged = s.lines.filter((l) =>
+      l.includes("unreadable_pending_action"),
+    )
+    expect(logged).toHaveLength(1)
+    expect(logged[0]).toContain("other,pending_actions")
+    expect(logged[0]).toContain("requestid,tool_name")
+    expect(logged[0]).not.toContain("SECRET-VALUE")
   })
 })

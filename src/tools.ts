@@ -22,6 +22,7 @@ import {
   MAX_ANSWER_TOTAL_CHARS,
   payloadOf,
   pendingAction,
+  unreadablePromptShape,
   permissionView,
   questionAnswers,
   QUESTION_KINDS,
@@ -326,6 +327,7 @@ export const MAX_ANSWERED = 1000
 export function toolSpecs(deps: ToolDeps): ToolSpec[] {
   const { api, cli, credentials } = deps
   const answered = deps.answered ?? new Set<string>()
+  const unreadable = new Set<string>()
   const now = deps.now ?? Date.now
   const sleep =
     deps.sleep ??
@@ -338,7 +340,21 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
    */
   async function prompt(id: string, session: Record<string, unknown>) {
     const action: PendingAction | undefined = pendingAction(session)
-    if (!action) return { pending_permission: null, pending_question: null }
+    if (!action) {
+      // Waiting on the owner with a prompt that cannot be read: say once per
+      // session what shape the record has (key names only, never values).
+      const shape = unreadablePromptShape(session)
+      if (shape && !unreadable.has(id)) {
+        if (unreadable.size >= 1000) unreadable.clear()
+        unreadable.add(id)
+        deps.logger.warn("unreadable_pending_action", {
+          session: id,
+          metadata_keys: shape.metadata,
+          action_keys: shape.action,
+        })
+      }
+      return { pending_permission: null, pending_question: null }
+    }
     const input = action.input ?? (await requestInput(id, action.requestId))
     return isQuestion(action)
       ? {
@@ -939,7 +955,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       request_id: z
         .string()
         .min(1)
-        .max(128)
+        .max(256)
         .describe("pending_permission.request_id, as it was shown."),
       decision: z
         .enum(["allow", "deny"])
@@ -1035,7 +1051,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       request_id: z
         .string()
         .min(1)
-        .max(128)
+        .max(256)
         .describe("pending_question.request_id, as it was shown."),
       answers: z
         .array(
