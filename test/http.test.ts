@@ -97,7 +97,7 @@ describe("the HTTP side", () => {
     expect(right.status).toBe(200)
   })
 
-  it("lists the sixteen tools over MCP, with their annotations", async () => {
+  it("lists the seventeen tools over MCP, with their annotations", async () => {
     const { base, fake } = await serve("a-long-enough-token-123")
     const client = new Client({ name: "test", version: "1" })
     await client.connect(
@@ -113,6 +113,7 @@ describe("the HTTP side", () => {
       "answer_question",
       "archive_session",
       "ask_session",
+      "compact_session",
       "get_session",
       "interrupt_session",
       "list_environments",

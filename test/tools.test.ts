@@ -36,7 +36,7 @@ function busySession(s: ReturnType<typeof setup>) {
 }
 
 describe("the tools", () => {
-  it("are sixteen, read tools marked read-only and the rest not", () => {
+  it("are seventeen, read tools marked read-only and the rest not", () => {
     const s = setup()
     const specs = toolSpecs(s.deps)
     const tiers = Object.fromEntries(
@@ -51,6 +51,7 @@ describe("the tools", () => {
       login_status: true,
       send_message: false,
       interrupt_session: false,
+      compact_session: false,
       answer_permission: false,
       answer_question: false,
       start_session: false,

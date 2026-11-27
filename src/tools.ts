@@ -5,6 +5,7 @@ import { z } from "zod"
 
 import {
   ApiError,
+  CLIENT_PLATFORM,
   CURSOR,
   sessionIdOf,
   type ApiEvent,
@@ -103,6 +104,8 @@ export const POLL_MS = 1500
 /** A page of events while polling forward for an answer. */
 export const POLL_PAGE = 100
 export const INTERRUPT_ACK_MS = 15_000
+/** How long compact_session waits to see the session write its compact boundary. */
+export const COMPACT_ACK_MS = 30_000
 
 /** Control and format characters: a title is one line that shows. */
 const UNSEEN = /[\p{Cc}\p{Cf}]/u
@@ -804,6 +807,106 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
         },
       ])
       return { sent: true, interrupted }
+    },
+  }
+
+  /**
+   * Pages forward from `after` until the session writes a compact boundary
+   * (a `system` event with subtype `compact_boundary`, as the CLI writes
+   * when a compaction finished), within `ms`.
+   */
+  async function awaitCompaction(
+    id: string,
+    after: string | undefined,
+    ms: number,
+  ): Promise<boolean> {
+    const deadline = now() + ms
+    let cursor = after
+    for (;;) {
+      for (;;) {
+        if (now() >= deadline) return false
+        const page = await api.events(id, {
+          order: "asc",
+          limit: POLL_PAGE,
+          ...(cursor !== undefined ? { cursor } : {}),
+          timeoutMs: left(deadline),
+        })
+        if (
+          page.events.some(
+            (e) =>
+              typeOf(e) === "system" &&
+              payloadOf(e).subtype === "compact_boundary",
+          )
+        )
+          return true
+        const next = lastSeq(page.events) ?? page.nextCursor ?? undefined
+        const moved = next !== undefined && next !== cursor
+        if (moved) cursor = next
+        if (!page.nextCursor || !moved) break
+      }
+      if (now() + POLL_MS > deadline) return false
+      await sleep(POLL_MS)
+    }
+  }
+
+  const compactSession: ToolSpec = {
+    name: "compact_session",
+    title: "Compact a Claude Code session's context",
+    description:
+      "Compact a Claude Code cloud session: summarise its conversation so far to free up context, as /compact does. The session is not stopped or undone, but its earlier turns are replaced by a summary, so run it only when the owner asked. A busy session compacts after its current turn. Say what to keep in `instructions`.",
+    input: z.strictObject({
+      session_id: sessionId,
+      instructions: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe(
+          "What the summary should keep or stress, as /compact's own argument (up to 2000 characters). Left out: the default summary.",
+        ),
+    }),
+    output: z.object({
+      sent: z.boolean().describe("Whether the /compact command went in."),
+      command: z
+        .string()
+        .describe("The text sent to the session, exactly as /compact took it."),
+      compacted: z
+        .boolean()
+        .describe(
+          "Whether the session wrote its compact boundary within 30 seconds. False does not mean it failed: a busy session compacts after its current turn, and a long conversation takes longer. Read session_status.",
+        ),
+    }),
+    annotations: WRITE,
+    async run(args) {
+      const id = requireSession(args.session_id)
+      const extra =
+        typeof args.instructions === "string" ? args.instructions.trim() : ""
+      const command = extra ? `/compact ${extra}` : "/compact"
+      const deadline = now() + COMPACT_ACK_MS
+      const after = await newestSeq(id, deadline)
+      // With the CLI's own client platform, so the session runs the command
+      // rather than reading the text as a peer's message.
+      await api.postEvents(
+        id,
+        [
+          {
+            event_type: "user",
+            payload: {
+              type: "user",
+              uuid: randomUUID(),
+              session_id: id,
+              parent_tool_use_id: null,
+              message: { role: "user", content: command },
+            },
+          },
+        ],
+        left(deadline),
+        CLIENT_PLATFORM,
+      )
+      return {
+        sent: true,
+        command,
+        compacted: await awaitCompaction(id, after, left(deadline)),
+      }
     },
   }
 
@@ -1518,6 +1621,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     listEnvironments,
     sendMessage,
     interruptSession,
+    compactSession,
     answerPermission,
     answerQuestion,
     startSession,

@@ -43,6 +43,8 @@ type FakeSession = {
   /** Never answer control requests. */
   silent?: boolean
   pending: { requestId: string; due: number; response: unknown }[]
+  /** Polls at which a compaction a /compact command started finishes. */
+  compactions: number[]
   polls: number
   /** Events the session writes right after it answers (a busy session). */
   noiseAfterAnswer: number
@@ -118,6 +120,8 @@ export class FakeAnthropic {
   routineUpdates: [string, unknown][] = []
   /** Polls of the routine's sessions before the session shows. */
   runLagPolls = 0
+  /** Polls of the events before a /compact command's compact boundary shows. */
+  compactAfterPolls = 1
   private routineRuns = new Map<string, { id: string; polls: number }>()
   private seq = 1000
   private readonly now: () => number
@@ -162,6 +166,7 @@ export class FakeAnthropic {
       deviceBound: options.deviceBound,
       silent: options.silent,
       pending: [],
+      compactions: [],
       polls: 0,
       noiseAfterAnswer: options.noiseAfterAnswer ?? 0,
     })
@@ -332,6 +337,16 @@ export class FakeAnthropic {
           })
       }
       session.pending = session.pending.filter((p) => p.due > session.polls)
+      for (const due of session.compactions)
+        if (due <= session.polls)
+          this.addEvent(id, {
+            type: "system",
+            subtype: "compact_boundary",
+            compact_metadata: { trigger: "manual", pre_tokens: 90000 },
+          })
+      session.compactions = session.compactions.filter(
+        (due) => due > session.polls,
+      )
       const limit = Number(url.searchParams.get("limit") ?? "100")
       const desc = url.searchParams.get("sort_order") === "desc"
       const cursor = url.searchParams.get("cursor")
@@ -373,7 +388,25 @@ export class FakeAnthropic {
     for (const e of body.events) {
       const payload = e.payload ?? {}
       if (e.event_type === "user") {
-        this.addEvent(id, payload)
+        // As CCR ingress stamps it from the request header.
+        const platform = request.headers["anthropic-client-platform"]
+        this.addEvent(
+          id,
+          platform === undefined
+            ? payload
+            : { ...payload, client_platform: platform },
+        )
+        // As the CLI does: a user event with no client platform is taken as
+        // a peer's message, which is text; with the CLI's own, a slash
+        // command runs.
+        const text = (payload.message as { content?: unknown } | undefined)
+          ?.content
+        if (
+          platform === "claude_code_cli" &&
+          typeof text === "string" &&
+          /^\/compact(?:\s|$)/.test(text)
+        )
+          session.compactions.push(session.polls + this.compactAfterPolls)
         continue
       }
       if (e.event_type === "control_response") {
