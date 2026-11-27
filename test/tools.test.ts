@@ -36,7 +36,7 @@ function busySession(s: ReturnType<typeof setup>) {
 }
 
 describe("the tools", () => {
-  it("are seventeen, read tools marked read-only and the rest not", () => {
+  it("are eighteen, read tools marked read-only and the rest not", () => {
     const s = setup()
     const specs = toolSpecs(s.deps)
     const tiers = Object.fromEntries(
@@ -52,6 +52,7 @@ describe("the tools", () => {
       send_message: false,
       interrupt_session: false,
       compact_session: false,
+      run_command: false,
       answer_permission: false,
       answer_question: false,
       start_session: false,
@@ -62,7 +63,10 @@ describe("the tools", () => {
       login_finish: false,
     })
     for (const spec of specs) {
-      expect(spec.annotations.destructiveHint, spec.name).toBe(false)
+      // Only run_command: it can send /clear and /exit.
+      expect(spec.annotations.destructiveHint, spec.name).toBe(
+        spec.name === "run_command",
+      )
       expect(Object.keys(spec.annotations).sort()).toEqual([
         "destructiveHint",
         "idempotentHint",

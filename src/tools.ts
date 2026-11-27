@@ -107,6 +107,44 @@ export const INTERRUPT_ACK_MS = 15_000
 /** How long compact_session waits to see the session write its compact boundary. */
 export const COMPACT_ACK_MS = 30_000
 
+/**
+ * A slash command as run_command takes it: one line, no control or format
+ * characters, a name right after the slash.
+ */
+export const COMMAND_TEXT = /^\/\S[^\p{Cc}\p{Cf}]*$/u
+
+/**
+ * The CLI's built-in commands a remote client may run in a session (its
+ * bridge-safe set, read from 2.1.331), besides every skill and prompt
+ * command. Others may arrive as plain text. Not checked here: the session
+ * decides.
+ */
+export const DISPATCHED_COMMANDS = [
+  "/compact",
+  "/autocompact",
+  "/clear",
+  "/goal",
+  "/context",
+  "/usage",
+  "/usage-credits",
+  "/extra-usage",
+  "/config",
+  "/model",
+  "/effort",
+  "/fast",
+  "/advisor",
+  "/focus",
+  "/output-style",
+  "/mcp",
+  "/rename",
+  "/color",
+  "/version",
+  "/auto-mode-setup",
+  "/skill-doctor",
+  "/reload-skills",
+  "/exit",
+]
+
 /** Control and format characters: a title is one line that shows. */
 const UNSEEN = /[\p{Cc}\p{Cf}]/u
 
@@ -881,32 +919,80 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
       const extra =
         typeof args.instructions === "string" ? args.instructions.trim() : ""
       const command = extra ? `/compact ${extra}` : "/compact"
-      const deadline = now() + COMPACT_ACK_MS
-      const after = await newestSeq(id, deadline)
-      // With the CLI's own client platform, so the session runs the command
-      // rather than reading the text as a peer's message.
-      await api.postEvents(
-        id,
-        [
-          {
-            event_type: "user",
-            payload: {
-              type: "user",
-              uuid: randomUUID(),
-              session_id: id,
-              parent_tool_use_id: null,
-              message: { role: "user", content: command },
-            },
+      const sent = await sendCommand(id, command, true)
+      return { sent: true, command, compacted: sent.compacted === true }
+    },
+  }
+
+  /**
+   * Posts a slash command as the CLI's own client (see CLIENT_PLATFORM).
+   * With `watch`, waits for the compact boundary a /compact writes.
+   */
+  async function sendCommand(
+    id: string,
+    command: string,
+    watch: boolean,
+  ): Promise<{ compacted: boolean | null }> {
+    const deadline = now() + COMPACT_ACK_MS
+    const after = watch ? await newestSeq(id, deadline) : undefined
+    await api.postEvents(
+      id,
+      [
+        {
+          event_type: "user",
+          payload: {
+            type: "user",
+            uuid: randomUUID(),
+            session_id: id,
+            parent_tool_use_id: null,
+            message: { role: "user", content: command },
           },
-        ],
-        left(deadline),
-        CLIENT_PLATFORM,
-      )
-      return {
-        sent: true,
-        command,
-        compacted: await awaitCompaction(id, after, left(deadline)),
-      }
+        },
+      ],
+      left(deadline),
+      CLIENT_PLATFORM,
+    )
+    return {
+      compacted: watch
+        ? await awaitCompaction(id, after, left(deadline))
+        : null,
+    }
+  }
+
+  const runCommand: ToolSpec = {
+    name: "run_command",
+    title: "Run a slash command in a Claude Code session",
+    description:
+      `Run a slash command in a Claude Code cloud session, as the Claude app does when the owner types it (send_message sends text, which a session never runs as a command). The session decides: it runs the commands its remote clients may use and may read others as plain text. Run only what the owner asked for. Those it runs: ${DISPATCHED_COMMANDS.join(", ")}, and any skill or prompt command. /clear drops the conversation and /exit ends the session. ` +
+      "A /compact answers whether the session compacted.",
+    input: z.strictObject({
+      session_id: sessionId,
+      command: z
+        .string()
+        .min(2)
+        .max(2000)
+        .regex(COMMAND_TEXT)
+        .describe(
+          "The command, on one line, starting with / and its name (up to 2000 characters), such as /compact or /model sonnet.",
+        ),
+    }),
+    output: z.object({
+      sent: z.boolean().describe("Whether the command went in."),
+      command: z.string().describe("The text sent to the session."),
+      compacted: z
+        .boolean()
+        .nullable()
+        .describe(
+          "For /compact: whether the session wrote its compact boundary within 30 seconds (false is not a failure). null for any other command: nothing says whether it ran, read session_status.",
+        ),
+    }),
+    annotations: { ...WRITE, destructiveHint: true },
+    async run(args) {
+      const id = requireSession(args.session_id)
+      const command = (args.command as string).trim()
+      const watch = /^\/compact(?:\s|$)/.test(command)
+      const sent = await sendCommand(id, command, watch)
+      return { sent: true, command, compacted: sent.compacted }
     },
   }
 
@@ -1622,6 +1708,7 @@ export function toolSpecs(deps: ToolDeps): ToolSpec[] {
     sendMessage,
     interruptSession,
     compactSession,
+    runCommand,
     answerPermission,
     answerQuestion,
     startSession,
