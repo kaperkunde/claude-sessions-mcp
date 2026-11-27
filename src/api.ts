@@ -20,6 +20,15 @@ export const MCP_SERVERS_BETA = "mcp-servers-2025-12-04"
 /** The beta of the routines API (`/v1/code/triggers`, and a routine's runs), as the CLI sends it. */
 export const TRIGGERS_BETA = "ccr-triggers-2026-01-30"
 
+/**
+ * The `anthropic-client-platform` the CLI itself sends on its sessions API
+ * calls. CCR ingress copies it onto a user event as `client_platform`; a
+ * user event with none is taken by the session as a message from another
+ * session (a peer), which never runs a slash command. With it the CLI
+ * dispatches `/compact` as the command it is (README.md, "Slash commands").
+ */
+export const CLIENT_PLATFORM = "claude_code_cli"
+
 export type ApiEvent = Record<string, unknown>
 
 export class ApiError extends Error {
@@ -139,6 +148,7 @@ export class SessionsApi {
       accept?: number[]
       beta?: string
       kind?: "session" | "events" | "create"
+      clientPlatform?: string
     } = {},
   ): Promise<{ status: number; data: unknown }> {
     let rejected: string | undefined
@@ -153,6 +163,8 @@ export class SessionsApi {
         Accept: "application/json",
       }
       if (body !== undefined) headers["Content-Type"] = "application/json"
+      if (options.clientPlatform !== undefined)
+        headers["anthropic-client-platform"] = options.clientPlatform
       const host: HostKey = "api"
       const started = this.now()
       const response = await this.transport({
@@ -260,12 +272,17 @@ export class SessionsApi {
     id: string,
     events: { event_type: string; payload: Record<string, unknown> }[],
     timeoutMs?: number,
+    clientPlatform?: string,
   ): Promise<void> {
     await this.call(
       "POST",
       `/v1/code/sessions/${id}/events`,
       { events },
-      { kind: "events", ...(timeoutMs !== undefined ? { timeoutMs } : {}) },
+      {
+        kind: "events",
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(clientPlatform !== undefined ? { clientPlatform } : {}),
+      },
     )
   }
 
